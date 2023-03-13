@@ -1,0 +1,2017 @@
+传统的spark程序基于RDD之间的转换操作，构造出一个RDD的DAG，并且通过final RDD上的action算子，定义了一个可以执行的spark job。此DAG包含了spark job所有相关的业务逻辑，包括数据的读取，转换等等。在不考虑性能的情况下，用这种方式可以写出满足任意要求的离线计算任务。现在很流行的函数式编程带来了新的反思，我们最终需要的其实是做什么，而不是教我怎么做。比如想算一个sum，用代码来写就是遍历所有元素，进行累加。但是熟练使用数据库的同学都知道这是一个函数就能解决的事情 - sum(score)。估计没有人会傻到读取数据库每一行记录再自己一个个算。spark sql在这种条件下应运而生，编写计算任务的程序员也应该关注业务逻辑，而不是专注于怎么基于每一条数据得到想要的结果。
+
+如果确定了使用sql来开发job，那么怎么从sql联系到spark擅长的内存计算呢？换句话说，怎么才能基于sql构造传统的DAG从而触发计算呢，这也就是catalyst要做的事情。介绍spark sql有一张经典的图片，
+
+本文也准备根据这张图片介绍的过程继续组织，但是会加入一些源代码和我的一些思考来方便理解，后面本文将分成如下几个部分
+Dataset的初步介绍
+spark sql的TreeNode体系，Plan体系，Expression体系
+antlr的初步介绍，spark sql的规范
+spark逻辑计划(logical plan)的生成以及优化
+Spark物理计划的生成
+spark的code gen技术
+Spark sql的最终执行
+
+Dataset/Dataframe
+Dataset与RDD类似，都是代表着若干数据的集合。Dataset和RDD都通过泛型参数定义了数据的类型，从api的层面来看，两者是一样的，在他们上面都定义了若干的transform算子和action算子，但在底层，二者完全不同。在RDD，是通过Dependency来描述RDD之间的依赖关系，而在Dataset，是通过一个叫做Logical plan的树来描述Dataset之间的关系，每当产生一次新的依赖，则在树上面增加一个父节点，最终形成一棵逻辑树。从逻辑树是可以推断出Dependency依赖关系的，但是从Dependency依赖无法构造出逻辑树，因为这中间丢失了逻辑树的节点类型信息。
+Dataset有一个Row泛型类，别名叫做Dataframe，即Dataframe=Dataset[Row]。在数据库领域中有一个术语叫做relation，relation代表着一个表示类型的heading，以及若干遵循这个heading的数据的集合。因此关系型数据库的表是一个relation，因为表有schema，表也存储数据。在spark sql中，Dataframe也是一种relation，它的泛型参数Row就代表着relation中的heading，它背后的Dataset就表示遵循这种heading的数据集（数据的类型也就是Row）。通过Row，或者说DataFrame的引入，spark正式与relation产生了交集，也为sql的引入打下了基础。因为本文主要关注spark sql，因此后面主要涉及到的Dataset都是指Dataframe。
+我们知道，Dataset是包含类型信息的，Dataframe只包含了Row类型的信息，怎么才能从一个Dataset转换到Dataframe，从而也和sql挂钩了。这里使用的是Dataset的toDF方法
+def toDF(colNames: String*): DataFrame = {
+ require(schema.size == colNames.size,
+   "The number of columns doesn't match.\n" +
+     s"Old column names (${schema.size}): " + schema.fields.map(_.name).mkString(", ") + "\n" +
+     s"New column names (${colNames.size}): " + colNames.mkString(", "))
+
+
+ val newCols = logicalPlan.output.zip(colNames).map { case (oldAttribute, newName) =>
+   Column(oldAttribute).as(newName)
+ }
+ select(newCols : _*)
+}
+因为我们还没有介绍过logical plan，因此对这个方法的实现过程不太理解，这里我们只要记住，通过传入列的列名，就能将一个携带schema的Dataset转化为一个Dataframe。如果想从RDD转化为Dataframe，也是使用这个方法，比如一个类型为tuple的RDD转化为Dataframe
+val rdd: RDD[(Int, String)] = …
+rdd.toDF()  // this implicit conversion creates a DataFrame with column name `_1` and `_2`
+rdd.toDF("id", "name")  // this creates a DataFrame with column name "id" and "name"
+已上我们就简单介绍了Dataset和Dataframe这两个概念，正如前面所说，Dataset是构造在Logical plan之上的，因此如果不介绍logical plan的话就像隔靴搔痒一样没法彻底领悟，因此接下来我们准备介绍spark sql中的核心概念logical plan.
+
+spark sql的TreeNode体系，QueryPlan体系，Expression体系
+TreeNode是一个抽象类，它有一个泛型参数BaseType表示其节点的类型，同时每个节点类型BaseType也必须继承自TreeNode。换句话说，每个子节点本身也是一棵树。
+abstract class TreeNode[BaseType <: TreeNode[BaseType]]
+我们即将提到的QueryPlan和Expression都是基于TreeNode实现的，他们都是TreeNode的子类
+QueryPlan:
+abstract class QueryPlan[PlanType <: QueryPlan[PlanType]] extends TreeNode[PlanType]
+Expression
+abstract class Expression extends TreeNode[Expression]
+我们看到QueryPlan本身仍然携带一个类型参数，这个类型参数代表具体的实现子类，比如后面介绍的LogicalPlan就是QueryPlan的一个子类实现。
+
+每个TreeNode对象还有一个children成员，表示这个节点的子节点，如果是叶子节点则children为null。对于TreeNode类来说，最重要的是定义在其上的若干方法，这些方法主要可以分成如下几类
+action类
+foreach方法：将f作用到数的每一个节点，按照先序顺序
+def foreach(f: BaseType => Unit): Unit
+foreachUp方法：将f作用到数的每一个节点，按照后序顺序
+def foreachUp(f: BaseType => Unit): Unit
+collect方法：将pf递归作用到节点以及其子节点上，并收集到Seq[B]中
+def collect[B](pf: PartialFunction[BaseType, B]): Seq[B]
+collectLeaves方法：收集这棵树的所有叶子节点到Seq中
+def collectLeaves(): Seq[BaseType]
+collectFirst方法：按照先序遍历的方式遍历树，直到找到第一个在pf的作用域内的元素
+def collectFirst[B](pf: PartialFunction[BaseType, B]): Option[B]
+transform类
+map方法：将f作用到每个元素上，并收集到Seq中
+def map[A](f: BaseType => A): Seq[A]
+flatMap方法：将f作用到每个元素上，生成Traversable[A]对象，最终返回一个Seq[A]
+def flatMap[A](f: BaseType => TraversableOnce[A]): Seq[A]
+mapProductIterator方法：将f作用到product的每个元素上，最终收集到Array中
+protected def mapProductIterator[B: ClassTag](f: Any => B): Array[B]
+mapChildren方法：将f作用（非递归）到每个children上，并返回原对象的copy
+def mapChildren(f: BaseType => BaseType): BaseType
+其他方法
+withNewChildren方法：替换树的原来的children，并且返回替换后的一个深度拷贝
+def withNewChildren(newChildren: Seq[BaseType]): BaseType
+我们稍微介绍一下这个方法的实现过程。因为TreeNode本身继承自Product类，因此其拥有一个构造函数，构造参数为Product的元素。当想要构造出原TreeNode的深拷贝的时候，通常是想在product的元素上面进行转换，得到新的product元素，再调用product的构造方法。withNewChildren就是对product的元素进行遍历，如果是children之一，则用新的children代替。当得到新的构造参数以后，通过反射调用构造方法构造新的TreeNode对象
+
+以上各方法的实现参见算法中的树的遍历，原理相同，需要注意的是遍历的顺序。TreeNode的相关内容我们就介绍到这里了，接下来我们看一下TreeNode的子类QueryPlan类，这也是spark sql中最重要的一个类型。QueryPlan同样也是一个拥有泛型参数的类
+abstract class QueryPlan[PlanType <: QueryPlan[PlanType]] extends TreeNode[PlanType]
+QueryPlan是一个抽象类，它继承自TreeNode类，加入了一些和sql相关的特性
+//里面定义了spark sql的配置信息
+def conf: SQLConf = SQLConf.get
+
+//定义了这个plan的输出类型，这里的输出类型是指Attribute类，对应了某一列的列名以及其数据类型。Attribute类也是catalyst类结构中的重要成员，它继承自Expression类，Expression我们后面会介绍
+def output: Seq[Attribute]
+
+//将plan的output包装成一个AttributeSet对象
+def outputSet: AttributeSet = AttributeSet(output)
+
+//这个plan的所有Expression所关联到的Attribute。expressions代表的是这个plan节点的相关表达式
+def references: AttributeSet = AttributeSet.fromAttributeSets(expressions.map(_.references))
+
+//这个plan节点的输入Attribute，对应的是其children的output
+def inputSet: AttributeSet =
+ AttributeSet(children.flatMap(_.asInstanceOf[QueryPlan[PlanType]].output))
+
+//由这个plan节点创造出来的Attribute
+def producedAttributes: AttributeSet = AttributeSet.empty
+
+//表示这个plan节点缺少的Attribute，即Expression中用到，但是children并没有提供
+def missingInput: AttributeSet = references -- inputSet -- producedAttributes
+
+//将output组成一个StructType类型的对象，表示这个plan的schema
+lazy val schema: StructType = StructType.fromAttributes(output)
+
+//用树形的方式打印这个plan的schema
+def schemaString: String = schema.treeString
+
+所有的属性我们就不一一介绍了，下面介绍一个重点的方法
+/**
+* Apply a map function to each expression present in this query operator, and return a new
+* query operator based on the mapped expressions.
+* mapExpressions遍历这个Product（继承自TreeNode）的所有元素，如果是Expression对象，则调用f方法进行转换；其他类型的处理参见源码；所有元素都
+* 处理完成后，调用TreeNode的makkeCopy(newArgs)方法构造新的plan对象
+*/
+def mapExpressions(f: Expression => Expression): this.type = {
+ var changed = false
+
+ @inline def transformExpression(e: Expression): Expression = {
+   val newE = CurrentOrigin.withOrigin(e.origin) {
+     f(e)
+   }
+   if (newE.fastEquals(e)) {
+     e
+   } else {
+     changed = true
+     newE
+   }
+ }
+
+ def recursiveTransform(arg: Any): AnyRef = arg match {
+   case e: Expression => transformExpression(e)
+   case Some(value) => Some(recursiveTransform(value))
+   case m: Map[_, _] => m
+   case d: DataType => d // Avoid unpacking Structs
+   case stream: Stream[_] => stream.map(recursiveTransform).force
+   case seq: Traversable[_] => seq.map(recursiveTransform)
+   case other: AnyRef => other
+   case null => null
+ }
+
+ val newArgs = mapProductIterator(recursiveTransform)
+
+ if (changed) makeCopy(newArgs).asInstanceOf[this.type] else this
+}
+
+QueryPlan是plan体系的基础，它将catalyst中的Expression等元素与TreeNode结合起来，构造出了sql语法树的原型。后面会介绍到的LogicalPlan,SparkPlan等plan都是基于QueryPlan。
+abstract class LogicalPlan
+ extends QueryPlan[LogicalPlan]
+ with AnalysisHelper
+ with LogicalPlanStats
+ with QueryPlanConstraints
+
+Logical plan，顾名思义，代表的是逻辑上面的计划，而不包含真正执行时的信息。换句话说此时的plan没有和具体的执行引擎绑定，等到后面的Spark Plan时就与spark的执行引擎密切相关了。logical plan在转化为SparkPlan之前所做的主要是两件事情
+分析
+优化
+这两个过程我们在后面介绍analyzed logical plan和optimized logical plan的时候都会介绍到。在这里我们先看一下LogicalPlan继承了QueryPlan后又引入了哪些东西。
+//logical plan在诞生之初是unresolved的，它只是通过sql建立起一棵语法树，这棵语法树代表了sql中的语法语义信息。当经过分析器分析以后，这个属性会变成true
+lazy val resolved: Boolean = expressions.forall(_.resolved) && childrenResolved
+
+//代表这棵树的子节点是否都已经resolved
+def childrenResolved: Boolean = children.forall(_.resolved)
+
+Logical plan还有三个方法与分析器相关，我们在后面再介绍。对于Logical Plan部分最重要的是Logical Plan的生成，后面的分析和优化都是在已经生成的Logical Plan树上执行。
+Logical plan主要通过reader读取数据源生成，在构建出原始的Logical Plan后再此基础上面进行project，filter等操作。我们举一个官方的例子，
+val path = "examples/src/main/resources/people.json"
+val peopleDS = spark.read.json(path).as[Person]
+peopleDS.show()
+// +----+-------+
+// | age|   name|
+// +----+-------+
+// |null|Michael|
+// |  30|   Andy|
+// |  19| Justin|
+// +----+-------+
+// $example off:create_ds$
+spark.read返回一个DataFrameReader对象，这里的json代表的是格式,最终调用的是load()方法得到Dataframe。load方法的流程如下：
+1、根据format的名称查找对应的DataSourceRegister类，加载这个类并创建出类的对象
+val lookupCls = DataSource.lookupDataSource(source, sparkSession.sessionState.conf)
+val cls = lookupCls.newInstance() match {
+ case f: FileDataSourceV2 if useV1Sources.contains(f.shortName()) ||
+   useV1Sources.contains(lookupCls.getCanonicalName.toLowerCase(Locale.ROOT)) =>
+   f.fallBackFileFormat
+ case _ => lookupCls
+}
+Json对应的类名是JsonFileFormat。如果加载出来的DataSourceRegister对象是一个DataSourceV2对象，则调用
+DataSourceV2Relation.create(
+ ds, sessionOptions ++ extraOptions.toMap + pathsOption,
+ userSpecifiedSchema = userSpecifiedSchema)
+方法创建LogicalPlan，否则调用
+loadV1Source(paths: _*)
+即
+sparkSession.baseRelationToDataFrame(
+ DataSource.apply(
+   sparkSession,
+   paths = paths,
+   userSpecifiedSchema = userSpecifiedSchema,
+   className = source,
+   options = extraOptions.toMap).resolveRelation())
+方法创建LogicalPlan。我们这里以json为例，它使用的是第二种方法创建DataSource，最终是调用baseRelationToDataFrame方法将DataSource转化为一个Dataframe.Dataframe的创建与LogicalPlan息息相关，在这里Dataframe通过如下的方式构建
+def baseRelationToDataFrame(baseRelation: BaseRelation): DataFrame = {
+ Dataset.ofRows(self, LogicalRelation(baseRelation))
+}
+这里的LogicalRelation就是LogicalPlan的一个子类，具体来说，它是LogicalPlan的子类LeafNode的子类。我们知道LogicalPlan的每个节点也是一个LogicalPlan，像代表底层的表的LogicalRelation，DataSourceV2Relation等通常都是一个LogicalPlan的叶子节点。这个很容易理解，因为数据的读取永远是处理的第一步。我们在介绍LogicalPlan的时候曾经介绍过几个重要的属性，那么对于LogicalRelation这个子类来说，这个属性的真实值是什么呢？因为LogicalRelation是叶子节点，所以我们只看一下它的输出是什么。LogicalRelation是一个case class,它的输出来源于它的构造参数baseRelation: BaseRelation。每一种DataSource都有对应的BaseRelation子类，对于Hdfs中的文件来说，其对应的BaseRelation子类叫做HadoopFsRelation。我们同样以HadoopFsRelation为例，它的构造过程为
+case (format: FileFormat, _)
+   if FileStreamSink.hasMetadata(
+     caseInsensitiveOptions.get("path").toSeq ++ paths,
+     sparkSession.sessionState.newHadoopConf()) =>
+ val basePath = new Path((caseInsensitiveOptions.get("path").toSeq ++ paths).head)
+ val tempFileCatalog = new MetadataLogFileIndex(sparkSession, basePath, None)
+ val fileCatalog = if (userSpecifiedSchema.nonEmpty) {
+   val partitionSchema = combineInferredAndUserSpecifiedPartitionSchema(tempFileCatalog)
+   new MetadataLogFileIndex(sparkSession, basePath, Option(partitionSchema))
+ } else {
+   tempFileCatalog
+ }
+ val dataSchema = userSpecifiedSchema.orElse {
+    //读取文件的内容，并推断schema
+   format.inferSchema(
+     sparkSession,
+     caseInsensitiveOptions,
+     fileCatalog.allFiles())
+ }.getOrElse {
+   throw new AnalysisException(
+     s"Unable to infer schema for $format at ${fileCatalog.allFiles().mkString(",")}. " +
+         "It must be specified manually")
+ }
+
+
+ HadoopFsRelation(
+   fileCatalog,
+   partitionSchema = fileCatalog.partitionSchema,
+   dataSchema = dataSchema,
+   bucketSpec = None,
+   format,
+   caseInsensitiveOptions)(sparkSession)
+在这里我们关注两样东西，fileCatalog,dataSchema。fileCatalog的类型是MetadataLogFileIndex，继承自FileIndex，主要用来生成待读取的文件列表；dataSchema表示读取出的数据的schema，如果在使用时没有传入schema，则通过schema推断来推断schema。对于json format来说，具体的infer实现可以参照JsonFileFormat类的inferSchema方法，这里不过多阐述。通过以上过程，得到了一个与DataSource相对应的BaseRelation，同时可以构造出最终的LogicalPlan，即LogicalRelation(baseRelation)。
+
+到这里为止，我们通过举一个json的例子，得到了位于叶子节点位置的LogicalRelation，它代表数据处理的最基础部分，读取数据。为了方便后面介绍Expression体系，我们准备再进一步，看一下更多种类的LogicalPlan。我们在前面介绍DataSet的时候提过，LogicalPlan描述的是DataSet之间的依赖关系，DataSet之间的转化与LogicalPlan之间的转化是等价的。依靠于LogicalPlan的树状结构，可以构建DataSet的树状依赖关系。叶子节点的LogicalPlan对应于最基本的DataSet，通过再此DataSet上执行api，能得到更复杂的LogicalPlan。我们以一个sql中最常见的select为例。select是DataSet的api之一，它的定义如下
+def select(col: String, cols: String*): DataFrame = select((col +: cols).map(Column(_)) : _*)
+
+select算子的输入时一系列列名，最终这些列名会转变为Column对象。所以执行的是这个方法
+def select(cols: Column*): DataFrame = withPlan {
+ Project(cols.map(_.named), planWithBarrier)
+}
+我们分步骤来看。首先是withPlan方法
+@inline private def withPlan(logicalPlan: LogicalPlan): DataFrame = {
+ Dataset.ofRows(sparkSession, logicalPlan)
+}
+DataSet的算子实现基本都与此有关，这个方法通过输入一个LogicalPlan来生成新的DataSet，具体来讲是DataFrame。通过这个方法作为桥梁，在实现DataSet算子的时候，可以只关注LogicalPlan的转换。在select算子中，新生成的LogicalPlan叫做Project，它有两个构造参数
+case class Project(projectList: Seq[NamedExpression], child: LogicalPlan)
+child比价好理解，这里的projectList就是列名，但是这里并不是我们前面见到的string类型的列名，或者说Column对象，而是一个叫做NamedExpression的序列。NamedExpression就是我们准备介绍的Expression体系的一员
+trait NamedExpression extends Expression
+如果把QueryPlan称为spark sql的骨架的话，Expression可以称作附着在骨架上面的肌肉。在这里，要想实现select算子，不仅仅需要构造出一个Project类型的Logical Plan，还需要知道select的列名；像和sql中聚合操作有关的LogicalPlan叫做Aggregate,它依赖的东西就更多了，比如依赖和分组相关的语句
+groupingExpressions: Seq[Expression]
+依赖聚合相关的语句
+aggregateExpressions: Seq[NamedExpression]
+从某种意义上来讲，Expression代表了一种业务逻辑，LogicalPlan只是框架。
+
+antlr和逻辑计划的生成
+antlr的全称叫做Another Tool for Language Recognition，用Java语言编写。通过antlr可以自定义DSL语言，只需要按照antlr的规范定义DSL的语法语义，antlr可以根据语法规范生成语法分析器和语义分析器等。antlr除了能够构建语法分析树外，还自动生成了基于监听器模式(listener)和访问者模式(visitor)的树遍历器。spark sql使用的是访问者模式，通过集成antlr生成的访问者模式的遍历器，可以实现自定义的业务逻辑，比如在spark sql中可以在访问语法树的时候生成逻辑计划。
+我们假设语法文件的文件名为x.g4，在spark sql中叫做SqlBase.g4，在定义完语法文件以后，调用antlr的命令可以自动生成如下的文件
+代表内部的token定义
+x.tokens
+xLexer.tokens
+
+代表词法分析器和语法分析器
+xLexer
+xParser
+
+代表两种方法语法树的方式，分为listener模式和visitor模式
+xBaseListener
+xListener
+xBaseVisitor
+xVisitor
+在spark sql中对应如下的文件
+
+
+这里面我们重点关注两个类，xParser和xVisitor，即SqlBaseParser和SqlBaseVisitor两个类。
+SqlBaseParser
+我们在前面经常提到语法树的概念，那么语法树的节点是什么类型呢？在spark sql中，所有的语法树节点的类型都以Context结尾，不同的节点类型对应不同的Context。在spark的语法文件SQLBase.g4中定义的位于根部的语法规则叫做SingleStatement，其对应的语法树节点类型为SingleStateContext
+
+SqlBase.g4里面定义的众多的语法规则，因此也产生了众多的Context节点，这些节点类型的定义都在自动生成的xParser中，
+public static class SingleStatementContext extends ParserRuleContext {
+  public StatementContext statement() {
+     return getRuleContext(StatementContext.class,0);
+  }
+  public TerminalNode EOF() { return getToken(SqlBaseParser.EOF, 0); }
+  public SingleStatementContext(ParserRuleContext parent, int invokingState) {
+     super(parent, invokingState);
+  }
+  @Override public int getRuleIndex() { return RULE_singleStatement; }
+  @Override
+  public void enterRule(ParseTreeListener listener) {
+     if ( listener instanceof SqlBaseListener ) ((SqlBaseListener)listener).enterSingleStatement(this);
+  }
+  @Override
+  public void exitRule(ParseTreeListener listener) {
+     if ( listener instanceof SqlBaseListener ) ((SqlBaseListener)listener).exitSingleStatement(this);
+  }
+  @Override
+  public <T> T accept(ParseTreeVisitor<? extends T> visitor) {
+     if ( visitor instanceof SqlBaseVisitor ) return ((SqlBaseVisitor<? extends T>)visitor).visitSingleStatement(this);
+     else return visitor.visitChildren(this);
+  }
+}
+SingleStateContext继承自ParserRuleContext类，最终继承的是ParserTree类，代表语法树的节点。语法树的节点一般都有子节点，像SingleStatementContext只有一个子节点，叫做statement，因此在SingleStatementContext中有一个方法叫做statement()，用于返回它的子节点StatementContext。我们举一个复杂的例子
+
+describeFuncName是一个语法规则， 因此它对应于一个Context，叫做DescribeFuncNameContext。我们看到describeFuncName语法规则是一种组合的规则，它的一个子规则叫做qulifiedName，那么在DescribeFuncNameContext中就能找到一个对应的方法，用于返回这个子节点
+
+因此每个语法规则都对应于一个xxxContext类，并且这个语法规则的子规则，都能在这个类的内部找到对应的方法返回子节点Context。那么这个找到子节点Context的方法是如何实现的呢？我们还是以DescribeFuncNameContext为例，看一下qulifiedName()方法的实现
+public QualifiedNameContext qualifiedName() {
+  return getRuleContext(QualifiedNameContext.class,0);
+}
+这里调用的是父类ParseRuleContext自带的方法getRuleContext，它的作用是遍历所有的child节点，找到序号为i的节点，将其强制类型转换为指定的类。因为describeFuncName的语法规则是”或”的串联，因此像后面的ComparisonOperatorContext,ArithmeticOperatorContext等获取的都是序号为i的节点。其他更复杂的Context类型我们就不多做介绍了，有兴趣的可以自己看一下antlr4的文档。
+antlr4能够帮我们自动生成SqlBaseParser类，通过执行其singleStatementContext方法就能获取到这个语法树的根节点
+public final SingleStatementContext singleStatement() throws RecognitionException
+当然还有其他的根节点类型，比如
+public final SingleExpressionContext singleExpression() throws RecognitionException
+public final StatementContext statement() throws RecognitionException
+
+
+SqlBaseVisitor
+antlr中的Context都实现了visit模式，每个Context内都定义了一个accept方法，接受一个ParseTreeVisitor对象visitor，由这个对象完成对这个Context对象的visit方法。ParseTreeVisitor也由antlr帮我们生成好了，也就是SqlBaseVisitor类。这其实是一个接口，内部并没有实现visit Context的过程。spark sql内自定义了一个子类，叫做SqlBaseBaseVisitor，但其本身对接口ParseTreeVisitor的实现极其简单，全部都委托为一个方法实现，e.g.
+/**
+* {@inheritDoc}
+*
+* <p>The default implementation returns the result of calling
+* {@link #visitChildren} on {@code ctx}.</p>
+*/
+@Override public T visitSingleStatement(SqlBaseParser.SingleStatementContext ctx) { return visitChildren(ctx); }
+/**
+* {@inheritDoc}
+*
+* <p>The default implementation returns the result of calling
+* {@link #visitChildren} on {@code ctx}.</p>
+*/
+@Override public T visitSingleExpression(SqlBaseParser.SingleExpressionContext ctx) { return visitChildren(ctx); }
+
+visitChildren是父类的方法，它对其子节点一一调用accept，最终把每个child得到的结果通过aggregateResult汇总起来。
+public T visitChildren(RuleNode node) {
+   T result = this.defaultResult();
+   int n = node.getChildCount();
+
+
+   for(int i = 0; i < n && this.shouldVisitNextChild(node, result); ++i) {
+       ParseTree c = node.getChild(i);
+       T childResult = c.accept(this);
+       result = this.aggregateResult(result, childResult);
+   }
+
+
+   return result;
+}
+
+因为SqlBaseBaseVisitor的实现很简单，因此accept的主要逻辑都是由其子类实现的，它的子类叫做AstBuilder
+/**
+* The AstBuilder converts an ANTLR4 ParseTree into a catalyst Expression, LogicalPlan or
+* TableIdentifier.
+*/
+class AstBuilder(conf: SQLConf) extends SqlBaseBaseVisitor[AnyRef] with Logging
+刚刚我们提到，SqlBaseBaseVisitor的每个visit方法都简化为了visitChildren方法，最终对所有children的visit结果进行聚合，在AstBuilder中对这一行为进行了重写，不仅重写了众多的visit方法，也重写了visitChildren方法
+/**
+* Override the default behavior for all visit methods. This will only return a non-null result
+* when the context has only one child. This is done because there is no generic method to
+* combine the results of the context children. In all other cases null is returned.
+*/
+override def visitChildren(node: RuleNode): AnyRef = {
+ if (node.getChildCount == 1) {
+   node.getChild(0).accept(this)
+ } else {
+   null
+ }
+}
+只有当节点只有一个child的时候，visitChildren方法才生效，否则返回的是null。那么AstBuilder方法又是如何重写众多visit方法，最终生成我们想要的LogicalPlan的呢？我们暂时先在这里停止，猜想一下AstBuilder肯定是通过visit不同的Context生成不同的LogicalPlan。那么怎么才能从我们提供的sql产生LogicalPlan呢，先看一下spark sql解析sql的过程。
+Spark sql执行sql的入口是sparkSession的sql方法
+def sql(sqlText: String): DataFrame = {
+ Dataset.ofRows(self, sessionState.sqlParser.parsePlan(sqlText))
+}
+这里通过执行sessionState.sqlParser.parsePlan(sqlText)得到了LogicalPlan。具体的解析过程是通过sqlParser实现的。sqlParser是一个接口，叫做ParserInterface，在spark sql中它的实现类叫做SparkSqlParser，
+class SparkSqlParser(conf: SQLConf) extends AbstractSqlParser
+刚刚提到的具体生成LogicalPLan的AstBuilder就是其成员。SparkSqlParser实际的父类叫做AbstractSqlParser，SparkSqlParser的parsePlan完全继承自其父类，实现如下
+override def parsePlan(sqlText: String): LogicalPlan = parse(sqlText) { parser =>
+ astBuilder.visitSingleStatement(parser.singleStatement()) match {
+   case plan: LogicalPlan => plan
+   case _ =>
+     val position = Origin(None, None)
+     throw new ParseException(Option(sqlText), "Unsupported SQL statement", position, position)
+ }
+}
+parsePlan方法分两步，第一步是基于sql构建语法树，第二步是基于语法树构建LogicalPlan。第二步我们前面已经介绍过了，只要visit context就好了，但是context又是怎么生成的呢，就是由第一步构建语法树生成。构建完语法树以后，才能访问语法树的root节点，再依次遍历子节点，从而产生LogicalPlan。语法树是一个抽象的概念，它其实就是语法分析器本身，即SqlBaseParser。SqlBaseParser类已经由antlr4自动生成了，因此第一步只要生成SqlBaeParser对象即可。
+//先基于sql,构建词法分析器(这里会把sql变为大写格式）
+val lexer = new SqlBaseLexer(new UpperCaseCharStream(CharStreams.fromString(command)))
+lexer.removeErrorListeners()
+lexer.addErrorListener(ParseErrorListener)
+lexer.legacy_setops_precedence_enbled = SQLConf.get.setOpsPrecedenceEnforced
+
+//基于词法分析器，构建语法分析器
+val tokenStream = new CommonTokenStream(lexer)
+val parser = new SqlBaseParser(tokenStream)
+parser.addParseListener(PostProcessor)
+parser.removeErrorListeners()
+parser.addErrorListener(ParseErrorListener)
+parser.legacy_setops_precedence_enbled = SQLConf.get.setOpsPrecedenceEnforced
+这段代码可以认为是样板代码，基本antlr4的使用姿势就是这样，所以我们继续看下一步。
+
+在sql解析的语法树中，根节点的子节点包含SingleStatementContext，因此以此为入口，执行的是
+astBuilder.visitSingleStatement(parser.singleStatement())
+即visit SingleStatementContext。具体的visit方法在astBuilder中实现。
+
+讲了这么多，我们看一个例子，看下面的一行sql，这里假设students是一张表
+val df = spark.sql("select sum(score),name from students group by name")
+解析出来的语法树为
+
+这里面最终要的节点是QuerySpecificationContext节点，它对应的语法的定义为
+
+我们在spark sql中经常使用的select语句就是遵循着这里的语法规范，在visitor中对应的visit方法为：
+/**
+* Create a logical plan using a query specification.
+*/
+override def visitQuerySpecification(
+   ctx: QuerySpecificationContext): LogicalPlan = withOrigin(ctx) {
+  //先根据其fromClause子语句构造relation计划
+ val from = OneRowRelation().optional(ctx.fromClause) {
+   visitFromClause(ctx.fromClause)
+ }
+  //基于relation logicalplan，构造最终的logic plan
+ withQuerySpecification(ctx, from)
+}
+第一步是解析from语句，构造出一个logicplan代表底层的表from，再调用withQuerySpecification方法实现对数据的transform和aggregate等操作。所以withQuerySpecification可以算是解析sql的最核心的方法。
+
+在withQuerySpecification方法中，第一步是解析namedExpressionSeq，即sql语句中的select后面，from前面的部分，在我们的例子中是
+SUM(SCORE),NAME
+namedExpressionSeq会分解成多个namedExpression
+SUM(SCORE)和NAME
+对于后者，经过一连串的调用后，将其解析为Expression
+override def visitColumnReference(ctx: ColumnReferenceContext): Expression = withOrigin(ctx) {
+ ctx.getStart.getText match {
+   case escapedIdentifier(columnNameRegex)
+     if conf.supportQuotedRegexColumnName && canApplyRegex(ctx) =>
+     UnresolvedRegex(columnNameRegex, None, conf.caseSensitiveAnalysis)
+   case _ =>
+     UnresolvedAttribute.quoted(ctx.getText)
+ }
+}
+所以这里注意到，并不总是将语法节点解析为LogialPlan的，这里返回的类型叫做Expression，具体来讲叫做UnresolvedRegex或者UnresolvedAttribute。
+SUM(SCORE)的解析稍微复杂点，因为涉及到了函数，这里不详细展开，最终返回的是Expression的子类UnresolvedFunction。
+到这里为止，解析namedExpression的工作就结束了，对应于withQuerySpecification方法的这一部分
+val expressions = Option(namedExpressionSeq).toSeq
+ .flatMap(_.namedExpression.asScala)
+ .map(typedVisit[Expression])
+
+接着是判断specType，默认情况下是select，也可以是map,reduce,transform等，我们就看select，这是比较常见的情况。接下来，在底层的relation logicalplan上面添加Filter，Project，Aggregate等节点。Filter对应的是sql中的where语句，
+val withFilter = withLateralView.optionalMap(where)(filter)
+Project利用的是刚刚解析出的namedExpression。
+val namedExpressions = expressions.map {
+ case e: NamedExpression => e
+ case e: Expression => UnresolvedAlias(e)
+}
+
+def createProject() = if (namedExpressions.nonEmpty) {
+ Project(namedExpressions, withFilter)
+} else {
+ withFilter
+}
+
+如果没有Aggregate操作，返回的就是Project，否则返回的是Aggregate。
+val withProject = if (aggregation == null && having != null) {
+ if (conf.getConf(SQLConf.LEGACY_HAVING_WITHOUT_GROUP_BY_AS_WHERE)) {
+   // If the legacy conf is set, treat HAVING without GROUP BY as WHERE.
+   withHaving(having, createProject())
+ } else {
+   // According to SQL standard, HAVING without GROUP BY means global aggregate.
+   withHaving(having, Aggregate(Nil, namedExpressions, withFilter))
+ }
+} else if (aggregation != null) {
+ val aggregate = withAggregation(aggregation, namedExpressions, withFilter)
+ aggregate.optionalMap(having)(withHaving)
+} else {
+ // When hitting this branch, `having` must be null.
+ createProject()
+}
+因为我们sql中有group by语句，所以是存在Aggregate的，接下来看解析Aggregate的过程，
+val aggregate = withAggregation(aggregation, namedExpressions, withFilter)
+aggregate.optionalMap(having)(withHaving)
+withAgggregation方法用于在原来的LogicalPlan，即withFilter上面添加一层Aggregate节点，
+private def withAggregation(
+   ctx: AggregationContext,
+   selectExpressions: Seq[NamedExpression],
+   query: LogicalPlan): LogicalPlan = withOrigin(ctx) {
+ val groupByExpressions = expressionList(ctx.groupingExpressions)
+
+
+ if (ctx.GROUPING != null) {
+   // GROUP BY .... GROUPING SETS (...)
+   val selectedGroupByExprs =
+     ctx.groupingSet.asScala.map(_.expression.asScala.map(e => expression(e)))
+   GroupingSets(selectedGroupByExprs, groupByExpressions, query, selectExpressions)
+ } else {
+   // GROUP BY .... (WITH CUBE | WITH ROLLUP)?
+   val mappedGroupByExpressions = if (ctx.CUBE != null) {
+     Seq(Cube(groupByExpressions))
+   } else if (ctx.ROLLUP != null) {
+     Seq(Rollup(groupByExpressions))
+   } else {
+     groupByExpressions
+   }
+   Aggregate(mappedGroupByExpressions, selectExpressions, query)
+ }
+}
+Aggregate节点的定义如下
+case class Aggregate(
+   groupingExpressions: Seq[Expression],
+   aggregateExpressions: Seq[NamedExpression],
+   child: LogicalPlan)
+ extends UnaryNode
+我们注意到，刚刚解析出来的namedExpression充当了Aggregate节点中的aggregateExpressions，sql中的group by name充当了groupingExpressions
+
+withQuerySpecification方法中和我们的sql相关的解析过程就介绍到这里了，总结一下其过程
+输入一个relation LogicalPlan
+在原relation上面加一层filter节点得到withFilter，如果没有的话得到的是Project节点
+如果group by语句存在的话，在原withFilter节点上面添加一层Aggregate节点
+
+经过withQuerySpecification方法的实现，终于得到了想要的LogicalPlan了。
+
+逻辑计划->解析逻辑计划
+经过上述解析sql的过程，得到了一个原始的LogicalPlan，它打印出来是这样子的
+
+
+在看到LogicalPlan的时候，最大感受就是太原始了，基本上除了构造出一堆LogicalPlan和Expression以外什么都没有做，既没有检查表是否存在，也不检查列是否存在，更不要说聚合的函数是否存在了。我们这一部分要介绍的就是怎么将原始的LogicalPlan进一步优化。到这里为止我们进入到catalyst的精华部分。
+在前面我们见过了怎么从sql一步步转化为一个LogicalPlan，这里我们看一下怎么从LogicalPlan转变为一个Dataframe，即如下代码的执行过程
+Dataset.ofRows(self, sessionState.sqlParser.parsePlan(sqlText))
+Dataset的ofRows方法的实现为
+def ofRows(sparkSession: SparkSession, logicalPlan: LogicalPlan): DataFrame = {
+ val qe = sparkSession.sessionState.executePlan(logicalPlan)
+ qe.assertAnalyzed()
+ new Dataset[Row](sparkSession, qe, RowEncoder(qe.analyzed.schema))
+}
+这里根据创建出来的LogicalPlan构造一个QueryExection对象
+def executePlan(plan: LogicalPlan): QueryExecution = createQueryExecution(plan)
+然后由QueryExection对象qe完成对逻辑计划的分析。分析以后的逻辑计划叫做analyzed，本身也是LogicalPlan类型，
+lazy val analyzed: LogicalPlan = {
+ SparkSession.setActiveSession(sparkSession)
+ sparkSession.sessionState.analyzer.executeAndCheck(logical)
+}
+通过调用qe的assertAnalyzed方法实现了analyzed的加载构建。对logical的分析通过sparksession中的analyzer实现。analyzer是一个Analyzer对象，其继承自RuleExecutor[LogicalPlan]类。RuleExecutor支持对一个TreeType类型执行execute方法，返回仍然是一个TreeType类型。TreeType是指RuleExecutor的泛型参数。通过execute方法可以对一个LogicalPlan进行一些优化。RuleExecutor内部定义了几个重要的内部类
+//代表迭代的次数策略
+abstract class Strategy { def maxIterations: Int }
+//代表只迭代一次
+case object Once extends Strategy { val maxIterations = 1 }
+//类似于数学中的不动点定义，多次执行，直到遇到了不动点或者给定的最大迭代次数
+case class FixedPoint(maxIterations: Int) extends Strategy
+
+//RuleExecutor内部的策略集合，每个Batch都是一系列Rule的集合，同时每个Batch都有相应的迭代策略
+protected case class Batch(name: String, strategy: Strategy, rules: Rule[TreeType]*)
+
+RuleExecutor的主要属性为batches，代表它背后的所有策略
+protected def batches: Seq[Batch]
+
+RuleExecutor的executor方法主要就是针对每个batch起一个while循环，并且根据batch的的迭代策略判断什么时候停止循环。所以RuleExecutor的主要业务逻辑在Rule当中，或者说batch中。对于Analyzer来说，它的batches主要分成这几类
+Batch("Hints", fixedPoint,...)
+Batch("Simple Sanity Check", Once,…)
+Batch("Substitution", fixedPoint,…)
+Batch("Resolution", fixedPoint,…)
+Batch("Post-Hoc Resolution", Once,…)
+Batch("View", Once,…)
+Batch("Nondeterministic", Once,…)
+Batch("UDF", Once,…)
+Batch("FixNullability", Once,…)
+Batch("Subquery", Once,…)
+Batch("Cleanup", fixedPoint,…)
+每一个Batch内部都有一系列的Rule，这里我们省略了。接下来我们可以看几个典型的Rule
+ResolveRelations
+用于解析LogicalPlan中的UnresolvedRelation，过程如下：
+1、遍历LogicalPlan树，如果是UnresolvedRelation，则调用resolveRelation进行解析，返回结果代替之
+def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUp {
+ case i @ InsertIntoTable(u: UnresolvedRelation, parts, child, _, _) if child.resolved =>
+   EliminateSubqueryAliases(lookupTableFromCatalog(u)) match {
+     case v: View =>
+       u.failAnalysis(s"Inserting into a view is not allowed. View: ${v.desc.identifier}.")
+     case other => i.copy(table = other)
+   }
+ case u: UnresolvedRelation => resolveRelation(u)
+}
+
+resolveRelation方法中，先判断如果是UnresolvedRelation类型，则
+case u: UnresolvedRelation if !isRunningDirectlyOnFiles(u.tableIdentifier) =>
+ val defaultDatabase = AnalysisContext.get.defaultDatabase
+ val foundRelation = lookupTableFromCatalog(u, defaultDatabase)
+ resolveRelation(foundRelation)
+这里的lookupTableFromCatalog就是去搜索元数据，分析表的类型，最终调用到catalog的lookupRelation方法
+def lookupRelation(name: TableIdentifier): LogicalPlan = {
+ synchronized {
+   val db = formatDatabaseName(name.database.getOrElse(currentDb))
+   val table = formatTableName(name.table)
+   if (db == globalTempViewManager.database) {
+     globalTempViewManager.get(table).map { viewDef =>
+       SubqueryAlias(table, db, viewDef)
+     }.getOrElse(throw new NoSuchTableException(db, table))
+   } else if (name.database.isDefined || !tempViews.contains(table)) {
+     val metadata = externalCatalog.getTable(db, table)
+     if (metadata.tableType == CatalogTableType.VIEW) {
+       val viewText = metadata.viewText.getOrElse(sys.error("Invalid view without text."))
+       // The relation is a view, so we wrap the relation by:
+       // 1. Add a [[View]] operator over the relation to keep track of the view desc;
+       // 2. Wrap the logical plan in a [[SubqueryAlias]] which tracks the name of the view.
+       val child = View(
+         desc = metadata,
+         output = metadata.schema.toAttributes,
+         child = parser.parsePlan(viewText))
+       SubqueryAlias(table, db, child)
+     } else {
+       SubqueryAlias(table, db, UnresolvedCatalogRelation(metadata))
+     }
+   } else {
+     SubqueryAlias(table, tempViews(table))
+   }
+ }
+}
+我们举的例子中，students是自己创建的一个临时视图，所以lookupRelation返回的是SubqueryAlias(table, tempViews(table))对象。返回后仍然调用自身resolveRelation(foundRelation)，只是此时走进的分支不是case u: UnresolvedRelation，而是case _ => plan，也就是直接返回。因此经过resolveRelation以后，unsolvedRelation节点变成了SubqueryAlias节点。
+
+ResolveFunctions
+在上面例子中，我们使用到了一个函数sum(score)，在原始的LogicalPlan中，它被解析成UnsolveFunction节点。在ResolveFunctions的Rule的转换过程中，将去catalog中找出这个func的定义并代替之
+case u @ UnresolvedFunction(funcId, children, isDistinct) =>
+ withPosition(u) {
+   catalog.lookupFunction(funcId, children) match {
+     // AggregateWindowFunctions are AggregateFunctions that can only be evaluated within
+     // the context of a Window clause. They do not need to be wrapped in an
+     // AggregateExpression.
+     case wf: AggregateWindowFunction =>
+       if (isDistinct) {
+         failAnalysis(s"${wf.prettyName} does not support the modifier DISTINCT")
+       } else {
+         wf
+       }
+     // We get an aggregate function, we need to wrap it in an AggregateExpression.
+     case agg: AggregateFunction => AggregateExpression(agg, Complete, isDistinct)
+     // This function is not an aggregate function, just return the resolved one.
+     case other =>
+       if (isDistinct) {
+         failAnalysis(s"${other.prettyName} does not support the modifier DISTINCT")
+       } else {
+         other
+       }
+   }
+ }
+
+这里的catalog.lookupFunction去查找已经注册的所有函数，如果找到则进行替换。在catalog中有一个对象叫做SimpleFunctionRegistry，专门用来维护已经注册的函数，包含内部的函数和自定义的函数，即udf。内部的函数在构造SimpleFunctionRegistry的时候就已经加进来了，
+protected lazy val functionRegistry: FunctionRegistry = {
+ parentState.map(_.functionRegistry).getOrElse(FunctionRegistry.builtin).clone()
+}
+builtin就是内置的所有函数，
+val builtin: SimpleFunctionRegistry = {
+ val fr = new SimpleFunctionRegistry
+ expressions.foreach {
+   case (name, (info, builder)) => fr.registerFunction(FunctionIdentifier(name), info, builder)
+ }
+ fr
+}
+expressions的定义如下
+
+因为篇幅原因，我们只截取了一小部分，有兴趣的可以自行研究。因为我们使用的就是内置函数sum，所以这里catalog可以找到，对应的Expression为SUM，
+case class Sum(child: Expression) extends DeclarativeAggregate with ImplicitCastInputTypes
+
+找到SUM以后，用这个Expression来代替原来的UnresolveFunction。
+前面我们介绍了怎么解析表名，解析函数名，这里再看一下怎么解析字段名。
+ResolveReferences
+在ResolveReferences的解析过程中，如果遇到Project，Aggregate等节点包含*符号的，要对*进行展开。否则对遇到的LogicalPlan进行如下操作
+case q: LogicalPlan =>
+ logTrace(s"Attempting to resolve ${q.simpleString}")
+ q.mapExpressions(resolve(_, q))
+我们仍看上面例子，在前面生成的逻辑计划中，根节点是Aggregate节点，它内部的Expression包含groupingExpressions和AggregateExpressions。其中groupingExpressions size为1，成员为UnresolveAttribute，即sql中的name,
+
+
+对于这样的UnresolveAttribute对象，解析的过程如下
+case u @ UnresolvedAttribute(nameParts) =>
+ // Leave unchanged if resolution fails. Hopefully will be resolved next round.
+ val result =
+   withPosition(u) {
+     q.resolveChildren(nameParts, resolver)
+       .orElse(resolveLiteralFunction(nameParts, u, q))
+       .getOrElse(u)
+   }
+这个过程将输入的未解析的属性UnresolveAtrtribute变成对底层实际属性的引用，即将上层的字段名和底层的字段名相结合。实现的方法为resolveChildren
+def resolveChildren(
+   nameParts: Seq[String],
+   resolver: Resolver): Option[NamedExpression] =
+ resolve(nameParts, children.flatMap(_.output), resolver)
+这里调用的是resolve方法，resolve将这个节点LogicalPlan中的字段名和child的输出属性对应起来。
+protected def resolve(
+   nameParts: Seq[String],
+   input: Seq[Attribute],
+   resolver: Resolver): Option[NamedExpression] = {
+
+
+ // A sequence of possible candidate matches.
+ // Each candidate is a tuple. The first element is a resolved attribute, followed by a list
+ // of parts that are to be resolved.
+ // For example, consider an example where "a" is the table name, "b" is the column name,
+ // and "c" is the struct field name, i.e. "a.b.c". In this case, Attribute will be "a.b",
+ // and the second element will be List("c").
+ var candidates: Seq[(Attribute, List[String])] = {
+   // If the name has 2 or more parts, try to resolve it as `table.column` first.
+    //如果此UnresolvedAttribute的nameParts部分长度大于1，即nameParts是a.b或者a.b.c结构
+   if (nameParts.length > 1) {
+     input.flatMap { option =>
+       resolveAsTableColumn(nameParts, resolver, option)
+     }
+   } else {
+     Seq.empty
+   }
+ }
+
+
+ // If none of attributes match `table.column` pattern, we try to resolve it as a column.
+ if (candidates.isEmpty) {
+   candidates = input.flatMap { candidate =>
+     resolveAsColumn(nameParts, resolver, candidate)
+   }
+ }
+
+
+ def name = UnresolvedAttribute(nameParts).name
+
+
+ candidates.distinct match {
+   // One match, no nested fields, use it.
+   case Seq((a, Nil)) => Some(a)
+
+
+   // One match, but we also need to extract the requested nested field.
+   case Seq((a, nestedFields)) =>
+     // The foldLeft adds ExtractValues for every remaining parts of the identifier,
+     // and aliased it with the last part of the name.
+     // For example, consider "a.b.c", where "a" is resolved to an existing attribute.
+     // Then this will add ExtractValue("c", ExtractValue("b", a)), and alias the final
+     // expression as "c".
+     val fieldExprs = nestedFields.foldLeft(a: Expression)((expr, fieldName) =>
+       ExtractValue(expr, Literal(fieldName), resolver))
+     Some(Alias(fieldExprs, nestedFields.last)())
+
+
+   // No matches.
+   case Seq() =>
+     logTrace(s"Could not find $name in ${input.mkString(", ")}")
+     None
+
+
+   // More than one match.
+   case ambiguousReferences =>
+     val referenceNames = ambiguousReferences.map(_._1.qualifiedName).mkString(", ")
+     throw new AnalysisException(
+       s"Reference '$name' is ambiguous, could be: $referenceNames.")
+ }
+}
+最终调用child的AttributeReference的withName方法将UnresolveAttribute转化为AttributeReference
+override def withName(newName: String): AttributeReference = {
+ if (name == newName) {
+   this
+ } else {
+   AttributeReference(newName, dataType, nullable, metadata)(exprId, qualifier)
+ }
+}
+经过Analyzer的ResolveReference转换，每个LogicalPlan中的UnresolveExpression得以和其child的输出AttributeReference联系起来，转化为”同名”的AttributeReference，并且拥有相同的exprId，qualifier等等，表面了他们代表的是同一个属性。
+
+经过Analyzer的工作，原始的LogicalPlan变成了这样
+Aggregate [name#8], [sum(cast(score#9 as bigint)) AS sum(score)#15L, name#8]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+Aggregate中的groupExpression变为AttributeReference，它的exprId为8，
+
+名字为name,底层的表上的project中将元祖_1别名为name，此别名Alias的exprId也为8（当然，从底层读出来的属性不是name,而是_1,它才是AttributeReference，exprId也不是8，而是4。只是经过别名以后改名
+为name,并且别名Alias的exprId是8）
+
+这就将两个Expression关联起来了。
+
+看起来总算比原始的LogicalPlan顺眼的多了。
+在这里我们补充一下Analyzer中生效过的Rule，具体解析的过程可以自己研究代码
+ResolveRelations
+=== Applying Rule org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveRelations ===
+before
+'Aggregate ['name], [unresolvedalias('sum('score), None), 'name]
++- 'UnresolvedRelation `students`
+
+
+result
+'Aggregate ['name], [unresolvedalias('sum('score), None), 'name]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+ResolveReferences
+=== Applying Rule org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveReferences ===
+before
+'Aggregate ['name], [unresolvedalias('sum('score), None), 'name]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+
+
+result
+'Aggregate [name#8], [unresolvedalias('sum(score#9), None), name#8]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+ResolveFunctions
+=== Applying Rule org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveFunctions ===
+before
+'Aggregate [name#8], [unresolvedalias('sum(score#9), None), name#8]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+
+
+result
+'Aggregate [name#8], [unresolvedalias(sum(score#9), None), name#8]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+ResolveAliases
+=== Applying Rule org.apache.spark.sql.catalyst.analysis.Analyzer$ResolveAliases ===
+before
+'Aggregate [name#8], [unresolvedalias(sum(score#9), None), name#8]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+
+
+result
+Aggregate [name#8], [sum(score#9) AS sum(score)#19L, name#8]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+FunctionArgumentConversion
+=== Applying Rule org.apache.spark.sql.catalyst.analysis.TypeCoercion$FunctionArgumentConversion ===
+before
+Aggregate [name#8], [sum(score#9) AS sum(score)#19L, name#8]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+
+
+result
+Aggregate [name#8], [sum(cast(score#9 as bigint)) AS sum(score)#19L, name#8]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+ResolveTimeZone
+=== Applying Rule org.apache.spark.sql.catalyst.analysis.ResolveTimeZone ===
+before
+Aggregate [name#8], [sum(cast(score#9 as bigint)) AS sum(score)#19L, name#8]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+
+
+result
+Aggregate [name#8], [sum(cast(score#9 as bigint)) AS sum(score)#19L, name#8]
++- SubqueryAlias students
+  +- Project [_1#4 AS name#8, _2#5 AS score#9, _3#6 AS g#10]
+     +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._1, true, false) AS _1#4, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(assertnotnull(input[0, scala.Tuple3, true]))._3, true, false) AS _3#6]
+        +- ExternalRDD [obj#3]
+
+
+
+解析逻辑计划->优化逻辑计划
+我们知道spark sql的LogicalPlan和最终的执行路径息息相关，复杂冗余的LogicalPlan带来的执行代价也会更高。这种复杂度一方面是由问题本身带来，另一方面是由LogicalPlan的优化程度有关。与RDD时代的众多job优化技巧类似，在catalyst中也有对LogicalPlan的优化策略。基于前面生成的解析逻辑计划，通过执行优化器的优化策略，可以得到优化的逻辑计划。逻辑计划转为解析逻辑计划，使用的是sparkSession.sessionState.analyzer，而解析逻辑计划转化为优化逻辑计划，依赖的是sparkSession.sessionState.opitimizer。optimizer是Optimizer类的对象，与Analyzer一样，也是继承自RuleExecutor，因此在其内部也定义了一系列的优化策略
+
+
+回归到我们的例子上来，我们介绍几个与其相关的优化策略
+
+EliminateSubqueryAliases
+EliminateSubqueryAliases策略其实算是分析的策略，因为其并没有带来太大的优化。在我们的解析执行计划中，有这样一个节点，
+
+这里的SubqueryAlias可以认为是冗余的，EliminateSubqueryAliases的作用就是将这一层节点去除掉，它的策略就是用SubqueryAlias的子节点代替其本身
+object EliminateSubqueryAliases extends Rule[LogicalPlan] {
+ def apply(plan: LogicalPlan): LogicalPlan = plan transformUp {
+   case SubqueryAlias(_, child) => child
+ }
+}
+因此逻辑计划变成了这样
+
+
+ColumnPruning
+列裁剪策略用于将不需要用到的列去除掉，在我们的例子当中，聚合的时候我们只需要用到name,score两个属性，而下游的Project却包含了三列，name,score和g，这里的g是冗余的，所以可以优化掉。在我们的例子中列裁剪是这样执行的
+case a @ Aggregate(_, _, child) if (child.outputSet -- a.references).nonEmpty =>
+  a.copy(child = prunedChild(child, a.references))
+从代码中可以看出，它生效的原因是某个节点的列比起子节点的输出列少
+(child.outputSet -- f.references).nonEmpty
+它的策略是对child的列进行裁剪
+private def prunedChild(c: LogicalPlan, allReferences: AttributeSet) =
+  if ((c.outputSet -- allReferences.filter(c.outputSet.contains)).nonEmpty) {
+    Project(c.output.filter(allReferences.contains), c)
+  } else {
+    c
+  }
+裁剪很容易理解，就是在原来的child上面再增加一层Project就好了
+
+CollapseProject
+CollapseProject用于去除多余的Project。比如在上面列裁剪的例子中，如果child是Project，列裁剪后在Project上面又加了一层Project，就会造成Project的冗余。对于两个Project串联的情况，CollapseProject策略是这样处理的
+case p1 @ Project(_, p2: Project) =>
+  if (haveCommonNonDeterministicOutput(p1.projectList, p2.projectList)) {
+    //如果两个Project拥有相同,但不是deterministic的属性，则不变。
+    p1
+  } else {
+    //将p1用新的Project代替
+    p2.copy(projectList = buildCleanedProjectList(p1.projectList, p2.projectList))
+  }
+如果两个Project拥有相同的，但不是deterministic的属性，则保持原样。否则将原节点用新的Project，这个新的Project的列由buildCleanedProjectList方法得到
+private def buildCleanedProjectList(
+    upper: Seq[NamedExpression],
+    lower: Seq[NamedExpression]): Seq[NamedExpression] = {
+  // Create a map of Aliases to their values from the lower projection.
+  // e.g., 'SELECT ... FROM (SELECT a + b AS c, d ...)' produces Map(c -> Alias(a + b, c)).
+  val aliases = collectAliases(lower)
+
+
+  // Substitute any attributes that are produced by the lower projection, so that we safely
+  // eliminate it.
+  // e.g., 'SELECT c + 1 FROM (SELECT a + b AS C ...' produces 'SELECT a + b + 1 ...'
+  // Use transformUp to prevent infinite recursion.
+  val rewrittenUpper = upper.map(_.transformUp {
+    case a: Attribute => aliases.getOrElse(a, a)
+  })
+  // collapse upper and lower Projects may introduce unnecessary Aliases, trim them here.
+  rewrittenUpper.map { p =>
+    CleanupAliases.trimNonTopLevelAliases(p).asInstanceOf[NamedExpression]
+  }
+}
+第一步：基于child的projectList构造一个名叫aliases的map，遍历projectList中类型为Alias的expression，基于Alias构造Attribute作为key,Alias作为value。
+val aliases = collectAliases(lower)
+第二步：上游节点基于这个map进行替换
+val rewrittenUpper = upper.map(_.transformUp {
+  case a: Attribute => aliases.getOrElse(a, a)
+})
+这里稍微有点抽象，我们举一个例子，比如child的某个projectList包含这样一个Alias Alias(a+b,c)，即将a+b别名为c，则在map中存在这样一个entry: (c,Alias(a+b,c))。如果在上游节点有一个就是c，即AttributeReference(c)，这时就可以用map中AttributeReference(c)对应的value Alias(a+b,c)代替之。比如下面这条sql
+SELECT c + 1 FROM (SELECT a + b AS C ...
+这里模拟的就是两个Project相邻的情况，即
+... -> Project(c) -> Project(Alias(a+b,c)) -> RDD ...
+,在这种情况下，就可以将Project(Alias(a+b,c))节点去掉，同时将c替换掉，变成Alias(a+b,c)，那么树就会变成
+... -> Project(Alias(a+b,c)) -> RDD ...
+就达到了删除Project的目的。
+
+还有谓词下推，常量替换等常见的策略，这里就不一一介绍了。经过optimizer的策略，我们的逻辑计划变成了如下形式
+Aggregate [name#8], [sum(cast(score#9 as bigint)) AS sum(score)#15L, name#8]
++- Project [_1#4 AS name#8, _2#5 AS score#9]
+   +- SerializeFromObject [staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(input[0, scala.Tuple3, true])._1, true, false) AS _1#4, assertnotnull(input[0, scala.Tuple3, true])._2 AS _2#5, staticinvoke(class org.apache.spark.unsafe.types.UTF8String, StringType, fromString, assertnotnull(input[0, scala.Tuple3, true])._3, true, false) AS _3#6]
+      +- ExternalRDD [obj#3]
+逻辑计划树进行了进一步的简化！
+经过以上的sql解析，分析器，优化器的工作，终于得到了最终的逻辑计划树！
+
+执行计划
+在前面的例子中，我们通过一行sql得到了一个DataFrame
+val df = spark.sql("select sum(score),name from students group by name")
+这个DataFrame底层是基于一个解析后的LogicalPlan，但是和RDD的lazy机制一样，此时并没有触发任何的计算或者io操作，仅仅是完成了对执行计划的定义。我们可以在这个DataFrame上面进行各种操作，常见的简单的操作有select，filter等，他们都是在原来的LogicalPlan上面添加一层节点，比如Project，Filter节点，复杂一点的transform算子有join算子，groupBy算子等，我们在另一篇文章中对DataSet的这些算子进行讲解。在本文中，我们只看一个最简单的算子，take
+def take(n: Int): Array[T] = head(n)
+这是DataSet中的方法定义，T是泛型参数，对应于DataFrame的话T为Row类型。take算子调用的是head算子
+def head(n: Int): Array[T] = withAction("head", limit(n).queryExecution)(collectFromPlan)
+Dataset上的action操作都是通过调用withAction实现，
+private def withAction[U](name: String, qe: QueryExecution)(action: SparkPlan => U) = {
+  try {
+    qe.executedPlan.foreach { plan =>
+      plan.resetMetrics()
+    }
+    val start = System.nanoTime()
+    val result = SQLExecution.withNewExecutionId(sparkSession, qe) {
+      action(qe.executedPlan)
+    }
+    val end = System.nanoTime()
+    sparkSession.listenerManager.onSuccess(name, qe, end - start)
+    result
+  } catch {
+    case e: Exception =>
+      sparkSession.listenerManager.onFailure(name, qe, e)
+      throw e
+  }
+}
+主要的步骤是对DataSet中的executePlan执行action操作
+action(qe.executedPlan)
+在我们的例子中，action函数叫做collectFromPlan
+private def collectFromPlan(plan: SparkPlan): Array[T] = {
+  // This projection writes output to a `InternalRow`, which means applying this projection is not
+  // thread-safe. Here we create the projection inside this method to make `Dataset` thread-safe.
+  val objProj = GenerateSafeProjection.generate(deserializer :: Nil)
+  plan.executeCollect().map { row =>
+    // The row returned by SafeProjection is `SpecificInternalRow`, which ignore the data type
+    // parameter of its `get` method, so it's safe to use null here.
+    objProj(row).get(0, null).asInstanceOf[T]
+  }
+
+这个方法中，首先执行sparkPlan的executeCollect()方法将结果保存在一个数组中，
+def executeCollect(): Array[InternalRow] = {
+  val byteArrayRdd = getByteArrayRdd()
+  val results = ArrayBuffer[InternalRow]()
+  byteArrayRdd.collect().foreach { countAndBytes =>
+    decodeUnsafeRows(countAndBytes._2).foreach(results.+=)
+  }
+  results.toArray
+}
+得到结果以后，将数组的每一个Row元素转换成T类型
+objProj(row).get(0, null).asInstanceOf[T]
+
+要想理解上面这段过程，需要清楚sparkPlan是如何产生的，然后需要清楚怎么将sparkPlan的数据收集到一个数组中。我们先看第一部分，sparkPlan的产生。
+
+sparkPlan
+sparkPlan与LogicalPlan类似，都属于QueryPlan的一种，只是sparkPlan的泛型参数为SparkPlan
+abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializable
+LogicalPlan有众多子类，比如前面见到过的Project，Aggregate等子类都代表某种类型的LogicalPlan。SparkPlan类似，也有对应的子类，只是子类类名与LogicalPlan做了区分，在后缀加上了Exec，比如ProjectExec，AggregateExec。LogicalPlan转化为SparkPlan的过程由sessionState中的组件planner完成，planner的类型为SparkPlanner，它继承自QueryPlanner。
+lazy val sparkPlan: SparkPlan = {
+  SparkSession.setActiveSession(sparkSession)
+  // TODO: We use next(), i.e. take the first plan returned by the planner, here for now,
+  //       but we will implement to choose the best plan.
+  planner.plan(ReturnAnswer(optimizedPlan)).next()
+}
+我们可看到在进行转化之前，构造了一个虚拟的节点ReturnAnswer，将构造以后的optimizedPlan传入到方法plan当中。转化的方法plan定义在QueryPlanner中，
+def plan(plan: LogicalPlan): Iterator[PhysicalPlan] = {
+  // Obviously a lot to do here still...
+
+
+  // Collect physical plan candidates.
+  //step1
+  val candidates = strategies.iterator.flatMap(_(plan))
+
+
+  // The candidates may contain placeholders marked as [[planLater]],
+  // so try to replace them by their child plans.
+  //step2
+  val plans = candidates.flatMap { candidate =>
+    val placeholders = collectPlaceholders(candidate)
+
+
+    if (placeholders.isEmpty) {
+      // Take the candidate as is because it does not contain placeholders.
+      Iterator(candidate)
+    } else {
+      // Plan the logical plan marked as [[planLater]] and replace the placeholders.
+      placeholders.iterator.foldLeft(Iterator(candidate)) {
+        case (candidatesWithPlaceholders, (placeholder, logicalPlan)) =>
+          // Plan the logical plan for the placeholder.
+          val childPlans = this.plan(logicalPlan)
+
+
+          candidatesWithPlaceholders.flatMap { candidateWithPlaceholders =>
+            childPlans.map { childPlan =>
+              // Replace the placeholder by the child plan
+              candidateWithPlaceholders.transformUp {
+                case p if p == placeholder => childPlan
+              }
+            }
+          }
+      }
+    }
+  }
+
+  val pruned = prunePlans(plans)
+  assert(pruned.hasNext, s"No plan for $plan")
+  pruned
+}
+与我们前面见过的analyzer，optimizer类似，在sparkPlanner，或者说QueryPlanner中也包含众多strategy(在RuleExecutor中叫做rule)，每个strategy都可以将一个LogicalPlan转化为都多个sparkPlan。sparkPlanner中共有如下几种strategy
+override def strategies: Seq[Strategy] =
+  experimentalMethods.extraStrategies ++
+    extraPlanningStrategies ++ (
+    DataSourceV2Strategy ::
+    FileSourceStrategy ::
+    DataSourceStrategy(conf) ::
+    SpecialLimits ::
+    Aggregation ::
+    JoinSelection ::
+    InMemoryScans ::
+    BasicOperators :: Nil)
+如代码中step1注释所见，第一步就是利用每个strategy进行plan生成多个sparkPlan，再flatmap汇合起来。每个stragety都只对自己感兴趣的LogicalPlan类型感兴趣，在strategy的名字中也有体现，比如Aggregation策略只对Aggregate相关的节点生效，JoinSelection只对Join相关的类型生效。在LogicalPlan转化为SparkPlan之前，我们记得添加了一层ReturnAnswer节点，面对这个节点，只有SpecialLimits策略生效，如下：
+
+PlanLater是一个特殊的占位节点，它的子节点为刚刚ReturnAnswer的子节点，即我们原来的节点。PlanLater节点表示它的子节点还有待继续转化，自己只是作为占位用的，方便方法返回。因此在所有的策略转化一遍以后，其实并没有得到有意义的sparkPlan，只得到了一个充当占位作用的PlanLater节点。到这里step1就结束了，对于这种转化不完全的情况，plan方法会再次进行plan，并把占位节点PlanLater移除掉。因此plan方法是一个递归的方法，我们继续看后面的步骤。
+第二步，收集所有的占位节点PlanLater
+val plans = candidates.flatMap { candidate =>
+    val placeholders = collectPlaceholders(candidate)
+其中collectPlaceHolders方法为
+override protected def collectPlaceholders(plan: SparkPlan): Seq[(SparkPlan, LogicalPlan)] = {
+  plan.collect {
+    case placeholder @ PlanLater(logicalPlan) => placeholder -> logicalPlan
+  }
+}
+这里将candidate中的所有PlanLater收集起来。
+
+第三步，如果存在占位节点，则对占位节点的子节点LogicalPlan再次进行plan，并用plan后的无PlanLater节点的sparkPlan去取代原来candidate中的占位节点。
+placeholders.iterator.foldLeft(Iterator(candidate)) {
+  case (candidatesWithPlaceholders, (placeholder, logicalPlan)) =>
+    // Plan the logical plan for the placeholder.
+    val childPlans = this.plan(logicalPlan)
+
+
+    candidatesWithPlaceholders.flatMap { candidateWithPlaceholders =>
+      childPlans.map { childPlan =>
+        // Replace the placeholder by the child plan
+        candidateWithPlaceholders.transformUp {
+          case p if p == placeholder => childPlan
+        }
+      }
+    }
+}
+
+我们可以总结一下这个过程
+1、原来是一个ReturnAnswer节点，假设树为
+ReturnAnswer -> Aggregate -> Project -> Filter -> Relation
+2、策略SpecialLimits移除掉ReturnAnswer，返回一个占位节点，此时得到的candidate为
+PlanLater -> Aggregate -> Project -> Filter -> Relation
+3、想删除掉PlanLater，对其子节点LogicalPlan再次进行plan，这里是Aggregate节点，得到新的SparkPlan AggregateExec
+Aggregate -> Project -> Filter -> Relation
+变成
+AggregateExec -> xxx
+此时用新的SparkPlan取代掉PlanLater，即得到最终的SparkPlan AggregateExec.
+但是这里我们思考一个问题，因为每个Strategy只对特定的LogicalPlan生效。再上面的例子中，由对Aggregate生效的Aggregation策略进行转化，那么上面例子中的Project节点什么时候被转化为SparkPlan呢？答案是在plan Aggregate的时候，事实上，plan Aggregate以后，AggregateExec的child又是一个PlanLater节点，PlanLater的child是下一次要被plan的Project节点。在进行递归的时候会将Project转化为ProjectExec节点。当然了，这里AggregateExec的child是不是直接就是ProjectExec节点要看Aggregate这个strategy，包括其他的strategy是怎么作用的，事实上ProjectExec并不是直接的child。这个都是后话了，后面具体分析strategy的时候我们再看。
+总之，queryPlan在进行plan的时候就是这样，永远处理第一层节点，后面的用PlanLater占位，再对PlanLater的子节点LogicalPlan进行递归调用plan方法，最终取代掉原来的PlanLater。
+
+具体策略
+接下来我们举这样一个例子便于分析
+spark.sql(
+  """
+    |CREATE TABLE students (name string, gender string, score int)
+    |USING com.databricks.spark.csv
+    |OPTIONS (path "file:///Users/jiejiapeng/data/students.csv", header "true")
+  """.stripMargin)
+这里创建了一个table叫做students，读取的是csv数据
+spark.sql(
+  """
+    |create view total_score as select name,sum(score)
+    |from students
+    |where gender = 'male'
+    |group by name
+  """.stripMargin)
+这里创建了一个view total_score，用来对students做聚合，按照姓名聚合，计算总分。视图total_score的逻辑计划分别为
+=========logical plan===========
+'UnresolvedRelation `total_score`
+
+
+=========analyzed plan==========
+SubqueryAlias total_score
++- View (`default`.`total_score`, [name#5,sum(score)#6L])
+   +- Project [cast(name#0 as string) AS name#5, cast(sum(score)#8L as bigint) AS sum(score)#6L]
+      +- Aggregate [name#0], [name#0, sum(cast(score#2 as bigint)) AS sum(score)#8L]
+         +- Filter (gender#1 = male)
+            +- SubqueryAlias students
+               +- Relation[name#0,gender#1,score#2] csv
+
+
+=========optimized plan=========
+Aggregate [name#0], [name#0, sum(cast(score#2 as bigint)) AS sum(score)#6L]
++- Project [name#0, score#2]
+   +- Filter (isnotnull(gender#1) && (gender#1 = male))
+      +- Relation[name#0,gender#1,score#2] csv
+我们只关心最终的优化逻辑计划，下面基于这个逻辑计划进行分析
+Aggregation
+Aggregation策略对Aggregate节点生效，这是通过模式匹配实现的
+
+这里的PhysicalAggregation是scala模式匹配中的extractor，它将一个Aggregate对象分解为了groupingExpressions, aggregateExpressions, resultExpressions和child。分解的过程中进行如下的逻辑转换
+
+1、将groupExpression中非named的Expression进行命名，通过定义一个Alias实现
+val namedGroupingExpressions = groupingExpressions.map {
+  case ne: NamedExpression => ne -> ne
+  // If the expression is not a NamedExpressions, we add an alias.
+  // So, when we generate the result of the operator, the Aggregate Operator
+  // can directly get the Seq of attributes representing the grouping expressions.
+  case other =>
+    val withAlias = Alias(other, other.toString)()
+    other -> withAlias
+}
+
+2、将多次重复出现的聚合去重
+val aggregateExpressions = resultExpressions.flatMap { expr =>
+  expr.collect {
+    // addExpr() always returns false for non-deterministic expressions and do not add them.
+    case agg: AggregateExpression
+      if (!equivalentAggregateExpressions.addExpr(agg)) => agg
+  }
+}
+
+3、将聚合函数重写
+val rewrittenResultExpressions = resultExpressions.map { expr =>
+  expr.transformDown {
+    case ae: AggregateExpression =>
+      // The final aggregation buffer's attributes will be `finalAggregationAttributes`,
+      // so replace each aggregate expression by its corresponding attribute in the set:
+      equivalentAggregateExpressions.getEquivalentExprs(ae).headOption
+        .getOrElse(ae).asInstanceOf[AggregateExpression].resultAttribute
+    case expression =>
+      // Since we're using `namedGroupingAttributes` to extract the grouping key
+      // columns, we need to replace grouping key expressions with their corresponding
+      // attributes. We do not rely on the equality check at here since attributes may
+      // differ cosmetically. Instead, we use semanticEquals.
+      groupExpressionMap.collectFirst {
+        case (expr, ne) if expr semanticEquals expression => ne.toAttribute
+      }.getOrElse(expression)
+  }.asInstanceOf[NamedExpression]
+}
+
+4、构造返回
+Some((
+  namedGroupingExpressions.map(_._2),
+  aggregateExpressions,
+  rewrittenResultExpressions,
+  child))
+
+在这个例子中，返回的几个expression分别为
+groupingExpressions: AttributeReference(“name#0”)
+aggregateExpressions: AggregateExpression("sum(cast(score#2 as bigint))”)
+resultExpressions:AttributeReference(“name#0”),Alias(sum(cast(score#2 as bigint) AS sum(score)#6))
+
+这里就得到了Aggregate分解以后的几个表达式。最终调用如下代码返回SparkPlan
+aggregate.AggUtils.planAggregateWithoutDistinct(
+  groupingExpressions,
+  aggregateExpressions,
+  resultExpressions,
+  planLater(child))
+很显然，对于Aggregate的plan过程就在这里面了。planAggregateWithoutDistinct方法是AggUtils的方法，其签名为
+def planAggregateWithoutDistinct(
+    groupingExpressions: Seq[NamedExpression],
+    aggregateExpressions: Seq[AggregateExpression],
+    resultExpressions: Seq[NamedExpression],
+    child: SparkPlan): Seq[SparkPlan]
+我们看到，前面分解出来的几个表达式正好应用在这里，同时还顺便给Aggregate的child LogicalPlan加了一层PlanLater。planAggregateWithoutDistinct方法的实现如下：
+1、创建一个partial aggregation节点，partial aggregation的作用是进行局部聚合，比如在每个分区上面先进行sum操作
+val groupingAttributes = groupingExpressions.map(_.toAttribute)
+val partialAggregateExpressions = aggregateExpressions.map(_.copy(mode = Partial))
+val partialAggregateAttributes =
+  partialAggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
+val partialResultExpressions =
+  groupingAttributes ++
+    partialAggregateExpressions.flatMap(_.aggregateFunction.inputAggBufferAttributes)
+
+val partialAggregate = createAggregate(
+    requiredChildDistributionExpressions = None,
+    groupingExpressions = groupingExpressions,
+    aggregateExpressions = partialAggregateExpressions,
+    aggregateAttributes = partialAggregateAttributes,
+    initialInputBufferOffset = 0,
+    resultExpressions = partialResultExpressions,
+    child = child)
+创建一个AggregateExec节点执行的是createAggregate方法，它需要如下的参数：
+//表示child的数据需要服从的分布（请于分区区别开)
+requiredChildDistributionExpressions: Option[Seq[Expression]] = None,
+//表示有哪些分组
+groupingExpressions: Seq[NamedExpression] = Nil,
+//聚合表达式，里面包含了聚合函数，聚合模式等等
+aggregateExpressions: Seq[AggregateExpression] = Nil,
+//表示聚合缓冲区的列信息
+aggregateAttributes: Seq[Attribute] = Nil,
+//初始的buffer offset
+initialInputBufferOffset: Int = 0,
+//结果表达式
+resultExpressions: Seq[NamedExpression] = Nil,
+child: SparkPlan
+在构造partial aggregation的时候，需要构造出如上的表达式出来。这里需要主意一点的时候，partial aggregation的聚合表达式的模式全部改成了partial，表示其进行的是局部聚合。
+
+2、创建final aggregation节点，进行最终的数据汇总
+// 2. Create an Aggregate Operator for final aggregations.
+val finalAggregateExpressions = aggregateExpressions.map(_.copy(mode = Final))
+// The attributes of the final aggregation buffer, which is presented as input to the result
+// projection:
+val finalAggregateAttributes = finalAggregateExpressions.map(_.resultAttribute)
+
+
+val finalAggregate = createAggregate(
+    requiredChildDistributionExpressions = Some(groupingAttributes),
+    groupingExpressions = groupingAttributes,
+    aggregateExpressions = finalAggregateExpressions,
+    aggregateAttributes = finalAggregateAttributes,
+    initialInputBufferOffset = groupingExpressions.length,
+    resultExpressions = resultExpressions,
+    child = partialAggregate)
+与partial类似，这里将聚合函数又改为了Final，表示其代表的是最终的聚合结果。到这里就创造出了最终的AggregateExec节点。这个final AggregateExec的子节点是前面说的局部聚合节点partial AggregateExec，局部聚合节点的子节点才是原来的子节点PlanLater(child)。createAggregate的实现如下
+private def createAggregate(
+    requiredChildDistributionExpressions: Option[Seq[Expression]] = None,
+    groupingExpressions: Seq[NamedExpression] = Nil,
+    aggregateExpressions: Seq[AggregateExpression] = Nil,
+    aggregateAttributes: Seq[Attribute] = Nil,
+    initialInputBufferOffset: Int = 0,
+    resultExpressions: Seq[NamedExpression] = Nil,
+    child: SparkPlan): SparkPlan = {
+  val useHash = HashAggregateExec.supportsAggregate(
+    aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes))
+  if (useHash) {
+    HashAggregateExec(
+      requiredChildDistributionExpressions = requiredChildDistributionExpressions,
+      groupingExpressions = groupingExpressions,
+      aggregateExpressions = aggregateExpressions,
+      aggregateAttributes = aggregateAttributes,
+      initialInputBufferOffset = initialInputBufferOffset,
+      resultExpressions = resultExpressions,
+      child = child)
+  } else {
+    val objectHashEnabled = child.sqlContext.conf.useObjectHashAggregation
+    val useObjectHash = ObjectHashAggregateExec.supportsAggregate(aggregateExpressions)
+
+
+    if (objectHashEnabled && useObjectHash) {
+      ObjectHashAggregateExec(
+        requiredChildDistributionExpressions = requiredChildDistributionExpressions,
+        groupingExpressions = groupingExpressions,
+        aggregateExpressions = aggregateExpressions,
+        aggregateAttributes = aggregateAttributes,
+        initialInputBufferOffset = initialInputBufferOffset,
+        resultExpressions = resultExpressions,
+        child = child)
+    } else {
+      SortAggregateExec(
+        requiredChildDistributionExpressions = requiredChildDistributionExpressions,
+        groupingExpressions = groupingExpressions,
+        aggregateExpressions = aggregateExpressions,
+        aggregateAttributes = aggregateAttributes,
+        initialInputBufferOffset = initialInputBufferOffset,
+        resultExpressions = resultExpressions,
+        child = child)
+    }
+  }
+}
+在构造具体的AggregateExec节点之前先判断，是否是hash，判断依据是聚合缓冲区的类型。如果聚合缓冲区的每一列的数据类型都是如下之一，即可修改的类型，则表示可以hash
+static {
+  mutableFieldTypes = Collections.unmodifiableSet(
+    new HashSet<>(
+      Arrays.asList(new DataType[] {
+        NullType,
+        BooleanType,
+        ByteType,
+        ShortType,
+        IntegerType,
+        LongType,
+        FloatType,
+        DoubleType,
+        DateType,
+        TimestampType
+      })));
+}
+如果可以hash，则创建HashAggregateExec类型的节点。为什么hash和可变，可修改联系上呢。这是因为对于可变的类型，可以使用hashmap这样的数据结构保存缓冲区数据，性能比较高。如果是不可变类型的结构，只能使用依赖排序的数据结构保存缓冲区，性能相对比较低。在不支持hash的情况下，spark会选择使用SortAggregateExec节点类型。但是这里spark又进行了一次改进，如果能够使用自定义的Java object来表示聚合缓冲区内数据（而不是使用传统的Row），则使用ObjectHashAggregateExec类型节点而不是SortAggregateExec类型，这样能减少一次排序。这里详细的细节我们在看实现的时候再介绍。
+
+因为这里介绍到了聚合，这是sql中非常常见的，重要的语句。spark对于聚合操作使用的是Aggregate逻辑计划，AggregateExec执行计划。在前面我们没有过多单独介绍过Aggregate逻辑计划，这里可以稍微展开一下。
+case class Aggregate(
+    groupingExpressions: Seq[Expression],
+    aggregateExpressions: Seq[NamedExpression],
+    child: LogicalPlan)
+Aggregate逻辑节点表示需要对child背后的数据进行某种聚合，这种聚合有分组表达式，有聚合方式。分组就是我们在sql中写的group by key，key会被构造成表达式充当Aggregate中的groupingExpressions。在我们的students那个例子中，
+select name,sum(score) from students where gender = ‘male' group by name
+分组表达式就一个成员
+AttributeReference(name#)
+聚合方式主要指聚合表达式，包含聚合函数，聚合模式和是否包含distinct
+case class AggregateExpression(
+    aggregateFunction: AggregateFunction,
+    mode: AggregateMode,
+    isDistinct: Boolean,
+    resultId: ExprId)
+当然了，在我们例子中，聚合方式有两种，name和sum(score)，前者并不属于AggregateExpression，它只是一个AttributeReference(name#)，聚合表达式代表的是后者sum(score)。在这里，聚合函数是
+AggregateFunction: sum(cast(score#2 as bigint))
+聚合模式在初始化的时候统一都是complete。聚合模式是说这个聚合计划进行的是什么样子的聚合，有以下几种取值
+Partial：局部聚合
+PartialMerge：局部聚合
+Final：最终聚合
+Complete：全局聚合
+Partial和Final一般一起用，即一个complete模式的聚合会分解成两个聚合执行节点，上面的Aggregate Strategy我们也看了，这两个聚合执行节点的模式分布为partial和final，表示先进行局部聚合，再进行最终聚合。如果是局部聚合，那就是对原始数据进行初步聚合，如果是最终聚合，那就是对聚合缓冲区的数据进行聚合。PartialMerge模式一般是在distinct的时候用，比较少见。Complete就是不进行局部聚合，全部在一个节点进行，不做任务分解。聚合表达式中最终的是聚合函数这个类。在我们这个例子中，使用的聚合函数叫做SUM，它是AggregateFunction的一个子类。AggregateFunction的定义如下
+abstract class AggregateFunction extends Expression
+AggregateFunction有如下几个重要的属性
+//表示聚合区的schema
+def aggBufferSchema: StructType
+//表示聚合区的所有列属性
+def aggBufferAttributes: Seq[AttributeReference]
+//在聚合缓冲区的时候输入的缓冲区的列属性，一般就是aggBufferAttributes
+def inputAggBufferAttributes: Seq[AttributeReference]
+//当输入为空的时候的默认输出
+def defaultResult: Option[Literal] = None
+
+AggregateFunction有两个子类ImperativeAggregate和DeclarativeAggregate。ImperativeAggregates属于一种自定义的聚合函数，它包含如下属性和三个方法
+/*因为所有的聚合函数共享聚合缓存区，mutableAggBufferOffset表示这个聚合函数的缓冲数据在每个聚合缓冲区中的offset
+* {{{
+*          avg(x) mutableAggBufferOffset = 0
+*                  |
+*                  v
+*                  +--------+--------+--------+--------+
+*                  |  sum1  | count1 |  sum2  | count2 |
+*                  +--------+--------+--------+--------+
+*                                    ^
+*                                    |
+*                     avg(y) mutableAggBufferOffset = 2
+* }}}
+*/
+protected val mutableAggBufferOffset: Int
+/*将两个聚合缓冲区汇总的时候，这个聚合函数在input aggregation buffer中的offset，因为input aggregation buffer通常还带有分组key，所以这个offset一般和mutableAggBufferOffset不一样
+*另外需要注意aggregation buffer和input aggregation buffer的区别，一个是在聚合原始数据行，一个是为了聚合缓冲区
+{{{
+*          avg(x) inputAggBufferOffset = 1
+*                   |
+*                   v
+*          +--------+--------+--------+--------+--------+
+*          |  key   |  sum1  | count1 |  sum2  | count2 |
+*          +--------+--------+--------+--------+--------+
+*                                     ^
+*                                     |
+*                       avg(y) inputAggBufferOffset = 3
+* }}}
+*/
+protected val inputAggBufferOffset: Int
+
+//这个方法定义了如何在mutableAggBuffer中开辟一块新的缓冲区，以后可以用fieldNumber + mutableAggBufferOffset这个offset在mutableAggBuffer中访问对应field的数据
+def initialize(mutableAggBuffer: InternalRow): Unit
+//根据输入inputRow，更新mutableAggBuffer
+def update(mutableAggBuffer: InternalRow, inputRow: InternalRow): Unit
+//将聚合缓冲区mutableAggBuffer和输入的其他input聚合缓冲区inputAggBuffer汇总
+def merge(mutableAggBuffer: InternalRow, inputAggBuffer: InternalRow): Unit
+
+如上所示ImperativeAggregate定义了聚合函数的众多细节。AggregateFunction的另一子类叫做DeclarativeAggregate，这代表着catalyst中所有已定义的函数，包括例子中的SUM，还有COUNT，AVG等等函数。这类函数不需要像ImperativeAggregate那样关心那么多聚合的细节，它只需要实现如下的方法即可
+val initialValues: Seq[Expression]
+val updateExpressions: Seq[Expression]
+val mergeExpressions: Seq[Expression]
+这三个方法与ImperativeAggregate的三个方法的逻辑一样，只是更新缓冲区的细节由catalyst帮我们实现，在这里只要实现基于表达式的版本，底层是如何更新的不需要关心，我们以SUM为例
+initialValues，定义了初始值，这里为LongType的默认值null
+override lazy val initialValues: Seq[Expression] = Seq(
+  /* sum = */ Literal.create(null, sumDataType)
+)
+updateExpressions 定义了聚合的方式，这里用了ADD表达式，Coalesce用来防止null的情况，如果是null，则取0
+override lazy val updateExpressions: Seq[Expression] = {
+  if (child.nullable) {
+    Seq(
+      /* sum = */
+      Coalesce(Seq(Add(Coalesce(Seq(sum, zero)), Cast(child, sumDataType)), sum))
+    )
+  } else {
+    Seq(
+      /* sum = */
+      Add(Coalesce(Seq(sum, zero)), Cast(child, sumDataType))
+    )
+  }
+}
+mergeExpressions，和updateExpressions类似
+override lazy val mergeExpressions: Seq[Expression] = {
+  Seq(
+    /* sum = */
+    Coalesce(Seq(Add(Coalesce(Seq(sum.left, zero)), sum.right), sum.left))
+  )
+}
+
+和Aggregate相关的逻辑节点和表达式就介绍到这里了，后面我们再介绍AggregateExec的执行计划是如何执行的。
+
+在前面我们一直在将SparkPlanner的Aggregate strategy，它还有一些其他的的策略，我们再介绍一个相关的
+
+BasicOperators
+basicOperators的策略很简单，直接变成同名的Exec，比如Project直接变成ProjectExec，其他什么都不用做
+case logical.Project(projectList, child) =>
+  execution.ProjectExec(projectList, planLater(child)) :: Nil
+
+我们对sparkplanner的介绍就到这里了，到这里为止，我们的执行计划optimizedPlan变成了由sparkPlanner plan过的sparkPlan，原来的LogicalPlan节点都变成了SparkPlan类型的节点，离最后的执行又接近了一步。
+
+在sparkPlan可以执行之前，还需要再做一次优化，优化后的sparkPlan叫做executedPlan，最终基于这个plan来生成最终的RDD。由sparkPlan到executedPlan的转换在prepareForExecution中实现
+protected def prepareForExecution(plan: SparkPlan): SparkPlan = {
+  preparations.foldLeft(plan) { case (sp, rule) => rule.apply(sp) }
+}
+这里的preparations是一系列的Rule[SparkPlan]，共有如下的几种
+protected def preparations: Seq[Rule[SparkPlan]] = Seq(
+  python.ExtractPythonUDFs,
+  PlanSubqueries(sparkSession),
+  EnsureRequirements(sparkSession.sessionState.conf),
+  CollapseCodegenStages(sparkSession.sessionState.conf),
+  ReuseExchange(sparkSession.sessionState.conf),
+  ReuseSubquery(sparkSession.sessionState.conf))
+我们这里挑选两个着重介绍。首先先看EnsureRequirements。我们在使用RDD编程的时候，会使用一些算子，比如reduceByKey，groupByKey等等，这些算子往往会带来shuffle，即使用这些算子前后的RDD之间的依赖关系是shuffleDependency。在spark sql中，一个sparkPlan就代表一个RDD，因此两个sparkPlan之间也具备某种代表shuffle的联系。EnsureRequirements正是为了完成这项工作。我们回想一下，为什么需要shuffle，主要是还是为了计算出正确的结果。比如要想算出某个key对应的value之和，仅仅在节点上面进行计算肯定是不够的，因为正确的结果应该是全局的和。在我们前面的例子中，经过Aggregate生成的sparkPlan中有两个AgggregateExec节点，这两个节点就代表着局部的聚合和全局的聚合。因此在这两个AgggregateExec节点之间比如需要进行一次shuffle，才能将局部算出来的和shuffle到同一个分区中，从而计算出最终结果。这里我们看一下EnsureRequirements是如何添加shuffle的。因为EnsureRequirements也是一种Rule[SparkPlan]类型，因此我们直接看它的apply方法
+def apply(plan: SparkPlan): SparkPlan = plan.transformUp {
+  // TODO: remove this after we create a physical operator for `RepartitionByExpression`.
+  case operator @ ShuffleExchangeExec(upper: HashPartitioning, child, _) =>
+    child.outputPartitioning match {
+      case lower: HashPartitioning if upper.semanticEquals(lower) => child
+      case _ => operator
+    }
+  case operator: SparkPlan =>
+    ensureDistributionAndOrdering(reorderJoinPredicates(operator))
+}
+EnsureRequirements方法遍历所有的节点，如果operator本身已经是ShuffleExchangeExec节点，而且指定的分区和子节点的输出分区相同，则删除掉这个ShuffleExchangeExec节点，直接用子节点代替，否则调用ensureDistributionAndOrdering来判断是否需要进行shuffle。ShuffleExchangeExec节点就是为了进行shuffle，表示ShuffleExchangeExec节点的前后节点的关系是shuffle依赖的关系。我们继续看ensureDistributionAndOrdering方法。在此之前，我们先看一个概念Distribution，它描述了数据的分布信息，表示拥有同样的Expression的数据是如何分布的，这个分布有两层含义
+数据在多个分区之间如何分布，即数据分布在哪个分区上面
+数据在某个分区的内部是如何分布的
+ensureDistributionAndOrdering第一步就是判断一个parent节点需要的数据分布和child输出的数据分布是不是相同。
+val requiredChildDistributions: Seq[Distribution] = operator.requiredChildDistribution
+val requiredChildOrderings: Seq[Seq[SortOrder]] = operator.requiredChildOrdering
+var children: Seq[SparkPlan] = operator.children
+assert(requiredChildDistributions.length == children.length)
+assert(requiredChildOrderings.length == children.length)
+
+
+// Ensure that the operator's children satisfy their output distribution requirements.
+children = children.zip(requiredChildDistributions).map {
+  //如果某个子节点的数据输出的分布满足父节点的需要，则不动
+  case (child, distribution) if child.outputPartitioning.satisfies(distribution) =>
+    child
+  case (child, BroadcastDistribution(mode)) =>
+    BroadcastExchangeExec(mode, child)
+  case (child, distribution) =>
+    val numPartitions = distribution.requiredNumPartitions
+      .getOrElse(defaultNumPreShufflePartitions)
+    ShuffleExchangeExec(distribution.createPartitioning(numPartitions), child)
+}
+如果parent的分布和子节点的输出分布不同的话，则构造一个BroadcastExchangeExec或ShuffleExchangeExec节点，在执行的时候会对数据进行重新分布以满足父节点的需要。在我们的例子中，作为parent的AggregateExec的分布为ClusteredDistribution，它表示具有相同的表达式值的数据需要在同个分区中，而子节点的outputPartitioning是None，因此这里会构造出一个ShuffleExchangeExec节点。如果存在多个child，并且对每个child的需要的分布不一样，即分区数不一样，则全部统一成最大的分区数，
+val targetNumPartitions = requiredNumPartitions.getOrElse(childrenNumPartitions.max)
+
+children = children.zip(requiredChildDistributions).zipWithIndex.map {
+  case ((child, distribution), index) if childrenIndexes.contains(index) =>
+    //如果某个child的分区数和最大分区数一样，则不动
+    if (child.outputPartitioning.numPartitions == targetNumPartitions) {
+      child
+    } else {
+      val defaultPartitioning = distribution.createPartitioning(targetNumPartitions)
+      child match {
+        //否则，将其分区器换成分区数为targetNumPartitions的分区器
+        // If child is an exchange, we replace it with a new one having defaultPartitioning.
+        case ShuffleExchangeExec(_, c, _) => ShuffleExchangeExec(defaultPartitioning, c)
+        case _ => ShuffleExchangeExec(defaultPartitioning, child)
+      }
+    }
+
+  case ((child, _), _) => child
+}
+
+这样就创造出了若干分区数满足要求的ShuffleExchangeExec节点，接下来为这些ShuffleExchangeExec节点构造出ExchangeCoordinator节点。
+children = withExchangeCoordinator(children, requiredChildDistributions)
+最后如果parent节点需要对child的输出数据进行排序的话们还要加上SortExec节点，在执行的时候进行排序
+children = children.zip(requiredChildOrderings).map { case (child, requiredOrdering) =>
+  // If child.outputOrdering already satisfies the requiredOrdering, we do not need to sort.
+  if (SortOrder.orderingSatisfies(child.outputOrdering, requiredOrdering)) {
+    child
+  } else {
+    SortExec(requiredOrdering, global = false, child = child)
+  }
+}
+
+最后用生成的新的children代替原来operator的children
+operator.withNewChildren(children)
+
+以上就是对EnsureRequirements的介绍。接下来继续看CollapseCodegenStages这个Rule。CollapseCodegenStages用于在那些支持代码生成的plan前面添加WholeStageCodegen节点。codegen意为代码生成，代码生成的作用是为了提高执行速度。我们举个例子，有这样一个节点FilterExec，它用来对其child的输出数据进行过滤。FilterExec有一个属性叫做condition: Expression，这个表达式代表了过滤相关的业务逻辑。FilterExec在执行的时候通过condition: Expression对每一行数据进行计算，如果返回结果为false，则将其过滤掉
+protected override def doExecute(): RDD[InternalRow] = {
+  val numOutputRows = longMetric("numOutputRows")
+  child.execute().mapPartitionsWithIndexInternal { (index, iter) =>
+    //根据condition构造Predicate类
+    val predicate = newPredicate(condition, child.output)
+    predicate.initialize(0)
+    iter.filter { row =>
+      //调用Predicate类的eval方法
+      val r = predicate.eval(row)
+      if (r) numOutputRows += 1
+      r
+    }
+  }
+}
+从代码上来看，逻辑还是很清晰的，但是其执行效率却极其低下，原因是每一行数据都有进行一次虚函数的调用! 虚函数的调用会带来cpu分支预测的失败，从而导致性能的倒退。通过codegen技术可以自动生成java代码并进行编译，从而避免对象的方法调用。CollapseCodegenStages就是用于在节点之前添加WholeStageCodegen节点
+private def insertWholeStageCodegen(plan: SparkPlan): SparkPlan = plan match {
+  // For operators that will output domain object, do not insert WholeStageCodegen for it as
+  // domain object can not be written into unsafe row.
+  case plan if plan.output.length == 1 && plan.output.head.dataType.isInstanceOf[ObjectType] =>
+    plan.withNewChildren(plan.children.map(insertWholeStageCodegen))
+  case plan: CodegenSupport if supportCodegen(plan) =>
+    WholeStageCodegenExec(insertInputAdapter(plan))(WholeStageCodegenId.getNextStageId())
+  case other =>
+    other.withNewChildren(other.children.map(insertWholeStageCodegen))
+}
+
+它的执行过程是这样的，如果某个节点类型的data类型是自定义的ObjectType，则对其子节点进行insert操作。如果节点支持codegen，即实现了CodegenSupport，则将这个节点转变为WholeStageCodegenExec节点，并对原节点执行insertInputAdapter方法作为其子节点，如果这个节点不支持codegen，则其保持不变，并对其子类递归调用insertWholeStageCodegen
+insertInputAdapter方法的实现是这样的
+private def insertInputAdapter(plan: SparkPlan): SparkPlan = plan match {
+  case p if !supportCodegen(p) =>
+    // collapse them recursively
+    InputAdapter(insertWholeStageCodegen(p))
+  case j: SortMergeJoinExec =>
+    // The children of SortMergeJoin should do codegen separately.
+    j.withNewChildren(j.children.map(child => InputAdapter(insertWholeStageCodegen(child))))
+  case p =>
+    p.withNewChildren(p.children.map(insertInputAdapter))
+}
+
+在insertInputAdapter方法中，如果节点支持codegen，则递归作用在其子节点上，否则，将这个节点转化为InputAdapter节点，并对其子类进行insertWholeStageCodegen操作。两个方法的循环调用似乎有点绕人，我们举个例子来看，比如我们前面举的例子，经过了shuffle以后变成了这样
+AggregateExec1 -> ShuffleExchangeExec -> AggregateExec2 -> ProjectExec -> FilterExec -> ...
+这里除了ShuffleExchangeExec都支持codegen，那么CollapseCodegenStages的执行过程是这样的，先判断AggregateExec1支持codegen，生成第一个WholeStageCodegenExec节点。
+WholeStageCodegenExec1 -> AggregateExec1 -> ShuffleExchangeExec -> AggregateExec1 -> ProjectExec -> FilterExec -> ...
+然后对AggregateExec1调用insertInputAdapter，因为其支持codegen，则递归作用在子节点上。如果子节点也是支持codegen，则一直递归调用insertInputAdapter方法，不会产生新的WholeStageCodegenExec节点。但是因为其子节点ShuffleExchangeExec不支持codegen，则将ShuffleExchangeExec包装成InputAdapter节点，并对ShuffleExchangeExec调用insertWholeStageCodegen。根据insertWholeStageCodegen的过程，如果是非codegen，则保持不变，递归作用在其子节点上面，即AggregateExec2上，这时又会产生一个新的WholeStageCodegenExec2
+WholeStageCodegenExec1 -> AggregateExec1 -> InputAdapter -> ShuffleExchangeExec -> WholeStageCodegenExec2 -> AggregateExec2 -> ProjectExec -> FilterExec -> ...
+因为AggregateExec2的节点都支持codegen，所以不会再回到insertWholeStageCodegen方法中去，而是一直在insertInputAdapter中递归调用直到结束。
+
+我们总结一下insertWholeStageCodegen和insertInputAdapter方法的过程。CollapseCodegenStages先作用在原来的节点上，如果是codegen，则生成一个WholeStageCodegenExec节点，否则作用在其子节点上。一旦遇到了codegen，则生成WholeStageCodegenExec节点，并进入到insertInputAdapter中。后面如果不出现非codegen节点的话，都不会再进入到insertWholeStageCodegen方法中。但意外的情况是遇到了非codegen，则新生成了一个InputAdapter节点，并对其子节点重新进行insertWholeStageCodegen，这时候会生成一个新的WholeStageCodegenExec节点，然后再次回到insertInputAdapter方法的递归中去。所以最终的sparkPlan中的WholeStageCodegenExec个数为最开始的WholeStageCodegenExec节点加上子节点中非codegen的节点数。
+CollapseCodegenStages的全部流程就是这样，在原来的sparkPlan中插入了一些WholeStageCodegenExec节点，这些WholeStageCodegenExec节点的位置在非codegen节点之前，或者在这棵树的root节点上。
+
+到这里位置sparkPlan在执行之前的准备就结束了，下面我们继续看这个生成出来的sparkPlan是怎么得到计算结果的。
+我们再次回到DataSet的head方法上面去。head方法通过调用执行计划executedPlan的executeCollect()方法将RDD的数据收集到一个数组中并返回
+def executeCollect(): Array[InternalRow] = {
+  val byteArrayRdd = getByteArrayRdd()
+
+
+  val results = ArrayBuffer[InternalRow]()
+  byteArrayRdd.collect().foreach { countAndBytes =>
+    decodeUnsafeRows(countAndBytes._2).foreach(results.+=)
+  }
+  results.toArray
+}
+前面我们提到，每个执行计划都代表着一个RDD。每个执行计划通过执行execute方法可以得到一个RDD[InternalRow]，getByteArrayRdd()正是基于这个RDD而执行，它将这个RDD的每个partition的数据缓存在一个buffer中
+execute().mapPartitionsInternal { iter =>
+  var count = 0
+  val buffer = new Array[Byte](4 << 10)  // 4K
+  val codec = CompressionCodec.createCodec(SparkEnv.get.conf)
+  val bos = new ByteArrayOutputStream()
+  val out = new DataOutputStream(codec.compressedOutputStream(bos))
+  // `iter.hasNext` may produce one row and buffer it, we should only call it when the limit is
+  // not hit.
+  while ((n < 0 || count < n) && iter.hasNext) {
+    val row = iter.next().asInstanceOf[UnsafeRow]
+    out.writeInt(row.getSizeInBytes)
+    row.writeToStream(out, buffer)
+    count += 1
+  }
+  out.writeInt(-1)
+  out.flush()
+  out.close()
+  Iterator((count, bos.toByteArray))
+}
+这样每个partition都变成了这样一个Iterator，它里面只有一个元祖元素，key为这个分区内的行数，value为分区内的数据进行压缩的结果，即value是这样的形式
+[size] [bytes of UnsafeRow] [size] [bytes of UnsafeRow] ... [-1]
+在executeCollect方法中，接着将压缩后的数据收集到driver端进行解压缩。得到最终的Array[InternalRow]。
+
+怎么通过执行执行计划得到RDD是我们关心的内容，也就是sparkPlan的execute方法的实现过程。
+
+SparkPlan的执行
+sparkPlan的执行方法execute主要是委托给doExecute方法实现
+final def execute(): RDD[InternalRow] = executeQuery {
+  if (isCanonicalizedPlan) {
+    throw new IllegalStateException("A canonicalized plan is not supposed to be executed.")
+  }
+  doExecute()
+}
+doExecute方法由SparkPlan的子类单独实现。在我们的例子中，这时候的executePlan是这样子的
+WholeStageCodegenExec1 -> AggregateExec1 -> ShuffleExchangeExec -> AggregateExec1 -> ProjectExec -> FilterExec -> ...
+因此RDD由WholeStageCodegenExec的exec方法生成。虽然代码生成优化了执行速度，但这里我还是想介绍一下未优化前的执行路径，即暂时不考虑由codegen产生的WholeStageCodegenExec节点。我们先看AggregateExec的doExecute逻辑吧。sparkPlan的执行是一种火山模式，每个执行计划的doExecute的输入都是它的子节点的输出，在AggregateExec中对其子节点产生的RDD进行mapPartitionInternal操作，这样基于其子RDD的每个分区的Iterator能够产生一个新的Iterator，作为新的RDD的分区。前面提到AggregateExec根据聚合数据是否可变的特点分为了HashAggregateExec和SortAggregateExec，大多数情况下都是使用的HashAggregateExec，我们也主要看它的实现。HashAggregateExec的每个分区对应的Iterator叫做TungstenAggregationIterator，它的定义是这样的
+class TungstenAggregationIterator(
+    partIndex: Int,    //表示对一个child RDD的分区序号
+    groupingExpressions: Seq[NamedExpression],    //分组表达式
+    aggregateExpressions: Seq[AggregateExpression],    //聚合表达式，里面包含了聚合函数
+    aggregateAttributes: Seq[Attribute],    //表示聚合结果列
+    initialInputBufferOffset: Int,    //在聚合buffer中的offset
+    resultExpressions: Seq[NamedExpression],    //表示结果表达式
+    newMutableProjection: (Seq[Expression], Seq[Attribute]) => MutableProjection,    //用来创建mutable projections的函数
+    originalInputAttributes: Seq[Attribute],    //代表输入的数据的属性信息，即列信息
+    inputIter: Iterator[InternalRow],    //输入数据迭代器
+    testFallbackStartsAt: Option[(Int, Int)],
+    numOutputRows: SQLMetric,
+    peakMemory: SQLMetric,
+    spillSize: SQLMetric,
+    avgHashProbe: SQLMetric)
+  extends AggregationIterator(
+    partIndex,
+    groupingExpressions,
+    originalInputAttributes,
+    aggregateExpressions,
+    aggregateAttributes,
+    initialInputBufferOffset,
+    resultExpressions,
+    newMutableProjection)
+
+TungstenAggregationIterator的构造参数都比较容易理解，基本就是直接传入HashAggregateExec的属性。但是其中的newMutableProjection: (Seq[Expression], Seq[Attribute]) => MutableProjection值得我们关注一下。
+MutableProjection继承自Projection类，Projection类是一个抽象类，用于实现将一个InternalRow转化为另一个InternalRow。MutableProjection作为其子类，其直接在原来的InternalRow上进行修改，而不产生新的InternalRow对象。TungstenAggregationIterator传入的是用于生成MutableProjection的函数（而不是传入一个MutableProjection）。具体来说，这个函数是这样子的
+protected def newMutableProjection(
+    expressions: Seq[Expression],
+    inputSchema: Seq[Attribute],
+    useSubexprElimination: Boolean = false): MutableProjection = {
+  log.debug(s"Creating MutableProj: $expressions, inputSchema: $inputSchema")
+  GenerateMutableProjection.generate(expressions, inputSchema, useSubexprElimination)
+}
+它根据一个表达式序列和一个schema，可以构造出一个MutableProjection对象。底层是调用GenerateMutableProjection.generate方法实现。GenerateMutableProjection.generate和代码生成相关，我们暂时不多做介绍。我们只需要知道，通过这样一个函数，可以构造出MutableProjection对象。MutableProjection对象用于对一个InternalRow进行转换，这个转换的逻辑就在构造时传入的表达式当中。也就是说，MutableProjection的行为等价于表达式的行为。后面再遇到可以具体问题具体分析。
+
+
+TungstenAggregationIterator作为Iterator，也需要实现
+hasNext
+next
+这两个方法。在调用next方法的时候将聚合后的结果返回。要理解TungstenAggregationIterator需要理解两个问题，即
+如何对下游数据进行聚合，什么时候聚合，聚合中间结果缓存在哪里
+怎么返回聚合后的数据
+我们先看第一个问题，即如何对下游分区的数据进行聚合。TungstenAggregationIterator在构造后进行初始化，主要是如下几个部分
+1、初始化聚合缓冲区
+缓冲区类型为UnsafeRow。UnsafeRow是InternalRow的子类，对这个row内部的数据的操作都是基于Java的Unsafe类。UnsafeRow内部的每个字段，即列都占用8个字节，因此对序号为ordinal的访问可以直接计算出offset，并使用Unsafe访问到对应的内存。
+private[this] val initialAggregationBuffer: UnsafeRow = createNewAggregationBuffer()
+ createNewAggregationBuffer()方法创建出多个聚合函数共用的缓冲区，并且将对缓冲区进行初始化。
+private def createNewAggregationBuffer(): UnsafeRow = {
+  val bufferSchema = aggregateFunctions.flatMap(_.aggBufferAttributes)
+  val buffer: UnsafeRow = UnsafeProjection.create(bufferSchema.map(_.dataType))
+    .apply(new GenericInternalRow(bufferSchema.length))
+  // Initialize declarative aggregates' buffer values
+  expressionAggInitialProjection.target(buffer)(EmptyRow)
+  // Initialize imperative aggregates' buffer values
+  aggregateFunctions.collect { case f: ImperativeAggregate => f }.foreach(_.initialize(buffer))
+  buffer
+}
+缓冲区是一个UnsafeRow对象，对缓冲区进行初始化，对应的是前面介绍过的MutableProjection对InternalRow进行修改转化的逻辑，只是这里的修改是初始化而已。因此，需要基于每个聚合函数的初始化表达式构造MutableProjection对象，
+/**
+* Expressions for initializing empty aggregation buffers.
+*/
+val initialValues: Seq[Expression]
+
+// The projection used to initialize buffer values for all expression-based aggregates.
+protected[this] val expressionAggInitialProjection = {
+  val initExpressions = aggregateFunctions.flatMap {
+    case ae: DeclarativeAggregate => ae.initialValues
+    // For the positions corresponding to imperative aggregate functions, we'll use special
+    // no-op expressions which are ignored during projection code-generation.
+    case i: ImperativeAggregate => Seq.fill(i.aggBufferAttributes.length)(NoOp)
+  }
+  newMutableProjection(initExpressions, Nil)
+}
+并作用到缓冲区Row上。createNewAggregationBuffer()方法中的expressionAggInitialProjection正是这样的MutableProjection。如果聚合函数不是基于表达式 ，则不存在初始值表达式，则调用其自带的initialize方法对缓冲区进行初始化。这样就得到了初始化以后的缓冲区
+private[this] val initialAggregationBuffer: UnsafeRow = createNewAggregationBuffer()
+
+2、构造聚合中间结果map
+在TungstenAggregationIterator保存了一个map，用来保存临时的聚合结果。这个map的key为分组key，value为UnsafeRow
+private[this] val hashMap = new UnsafeFixedWidthAggregationMap(
+  initialAggregationBuffer,
+  StructType.fromAttributes(aggregateFunctions.flatMap(_.aggBufferAttributes)),
+  StructType.fromAttributes(groupingExpressions.map(_.toAttribute)),
+  TaskContext.get(),
+  1024 * 16, // initial capacity
+  TaskContext.get().taskMemoryManager().pageSizeBytes
+)
+
+hashMap虽然名叫hashMap，但并不是我们熟知的HashMap类型，而是叫做UnsafeFixedWidthAggregationMap类型，等到后面对其进行put/get时我们再介绍其实现细节。
+
+3、进行聚合计算
+进行初始化话以后，TungstenAggregationIterator就开始对子节点的分区进行聚合计算，并将聚合中间结果写到map中，这个过程在方法processInputs中实现
+private def processInputs(fallbackStartsAt: (Int, Int)): Unit = {
+  if (groupingExpressions.isEmpty) {
+    // If there is no grouping expressions, we can just reuse the same buffer over and over again.
+    // Note that it would be better to eliminate the hash map entirely in the future.
+    //如果没有group，则map中就一个key，使用专门的key叫做null
+    val groupingKey = groupingProjection.apply(null)
+    val buffer: UnsafeRow = hashMap.getAggregationBufferFromUnsafeRow(groupingKey)
+    //通过processRow方法对map中对应的buffer进行操作
+    while (inputIter.hasNext) {
+      val newInput = inputIter.next()
+      processRow(buffer, newInput)
+    }
+  } else {
+    var i = 0
+    while (inputIter.hasNext) {
+      val newInput = inputIter.next()
+      //根据输入数据，得到map中的key。这里又是使用到了Projection这种对象
+      val groupingKey = groupingProjection.apply(newInput)
+      var buffer: UnsafeRow = null
+      if (i < fallbackStartsAt._2) {
+      //根据聚合key，找到map中对应的buffer
+        buffer = hashMap.getAggregationBufferFromUnsafeRow(groupingKey)
+      }
+      if (buffer == null) {
+        //如果buffer为空，则说明一件退化成了基于sort的聚合
+        val sorter = hashMap.destructAndCreateExternalSorter()
+        if (externalSorter == null) {
+          externalSorter = sorter
+        } else {
+          externalSorter.merge(sorter)
+        }
+        i = 0
+        buffer = hashMap.getAggregationBufferFromUnsafeRow(groupingKey)
+        if (buffer == null) {
+          // failed to allocate the first page
+          throw new SparkOutOfMemoryError("No enough memory for aggregation")
+        }
+      }
+      //调用processRow方法将数据写入到缓冲中
+      processRow(buffer, newInput)
+      i += 1
+    }
+
+
+    if (externalSorter != null) {
+      val sorter = hashMap.destructAndCreateExternalSorter()
+      externalSorter.merge(sorter)
+      hashMap.free()
+
+
+      switchToSortBasedAggregation()
+    }
+  }
+}
+
+我们看到，第一步是根据输入的数据计算key是什么，调用的是groupingProjection.apply(newInput)方法。凡是涉及到从一个InternalRow到另一个InternalRow的转换都是通过Projection实现的，这里的groupingProjection就是实现这种过程的，它的定义如下
+protected val groupingProjection: UnsafeProjection =
+  UnsafeProjection.create(groupingExpressions, inputAttributes)
+如果不存在group分组语句的话，调用的是groupingProjection.apply(null)来计算key。计算出key以后，通过map获取到这个key对应的缓冲区。在hash map内部维护了用来保存数据的真实map叫做BytesToBytesMap map。BytesToBytesMap将每个key value保存在一片连续的内存区域中，并且用这片内存区域的末尾8字节指向下一个map entry。具体内存的组织我们就不细看了。依赖于这个BytesToBytesMap map，hash map用于查找某个key对应的内存区域的方法实现是这样的
+public UnsafeRow getAggregationBufferFromUnsafeRow(UnsafeRow key, int hash) {
+  // Probe our map using the serialized key
+  //第一步先在BytesToBytesMap找到这个key对应的内存区域
+  final BytesToBytesMap.Location loc = map.lookup(
+    key.getBaseObject(),
+    key.getBaseOffset(),
+    key.getSizeInBytes(),
+    hash);
+  if (!loc.isDefined()) {
+    // This is the first time that we've seen this grouping key, so we'll insert a copy of the
+    // empty aggregation buffer into the map:
+    //如果没有这个key，则开辟一块内存，并用emptyAggregationBuffer来初始化这块内存
+    boolean putSucceeded = loc.append(
+      key.getBaseObject(),
+      key.getBaseOffset(),
+      key.getSizeInBytes(),
+      emptyAggregationBuffer,
+      Platform.BYTE_ARRAY_OFFSET,
+      emptyAggregationBuffer.length
+    );
+    if (!putSucceeded) {
+      return null;
+    }
+  }
+
+
+  // Reset the pointer to point to the value that we just stored or looked up:
+  //将指针指向key对应的内存区域
+  currentAggregationBuffer.pointTo(
+    loc.getValueBase(),
+    loc.getValueOffset(),
+    loc.getValueLength()
+  );
+  return currentAggregationBuffer;
+}
+如果key在BytesToBytesMap中不存在的话，则返回试图开辟空间创建。但是如果没有办法创建成功，比如没有可用的内存的话，或者key的数目超过了2^29的话，则返回null，此时需要退化成基于sort的方式保存数据。即
+if (buffer == null) {
+  val sorter = hashMap.destructAndCreateExternalSorter()
+  if (externalSorter == null) {
+    externalSorter = sorter
+  } else {
+    externalSorter.merge(sorter)
+  }
+  i = 0
+  buffer = hashMap.getAggregationBufferFromUnsafeRow(groupingKey)
+  if (buffer == null) {
+    // failed to allocate the first page
+    throw new SparkOutOfMemoryError("No enough memory for aggregation")
+  }
+}
+通过调用hashMap.destructAndCreateExternalSorter构造出BytesToBytesMap对应的UnsafeKVExternalSorter
+public UnsafeKVExternalSorter destructAndCreateExternalSorter() throws IOException {
+  return new UnsafeKVExternalSorter(
+    groupingKeySchema,
+    aggregationBufferSchema,
+    SparkEnv.get().blockManager(),
+    SparkEnv.get().serializerManager(),
+    map.getPageSizeBytes(),
+    (int) SparkEnv.get().conf().get(
+      package$.MODULE$.SHUFFLE_SPILL_NUM_ELEMENTS_FORCE_SPILL_THRESHOLD()),
+    map);
+}
+
+它将BytesToBytesMap中的数据进行排序，并溢写到磁盘中。溢写以后BytesToBytesMap可以重新用来写入数据，而UnsafeKVExternalSorter则不能写入任何数据。如果已经溢写过数据，则将新溢写的数据和已经存在的数据合并
+if (externalSorter == null) {
+  externalSorter = sorter
+} else {
+  externalSorter.merge(sorter)
+}
+这样又可以从BytesToBytesMap中获取或者新建buffer了。获取到buffer以后，调用processRow(buffer, newInput)对这块数据进行修改，实现保存聚合中间结果的目的。
+
+这样将子分区的数据全部写入到hash map以后，在最后再与磁盘中数据一起汇合
+if (externalSorter != null) {
+  val sorter = hashMap.destructAndCreateExternalSorter()
+  externalSorter.merge(sorter)
+  hashMap.free()
+
+
+  switchToSortBasedAggregation()
+}
+
+我们继续看processRow方法的实现过程。
+protected val processRow: (InternalRow, InternalRow) => Unit =
+  generateProcessRow(aggregateExpressions, aggregateFunctions, inputAttributes)
+它是通过generateProcessRow方法产生的。generateProcessRow需要传入聚合表达式和聚合函数，输入属性。这里的aggregateFunctions也是通过聚合表达式aggregateExpressions产生。
+protected def generateProcessRow(
+    expressions: Seq[AggregateExpression],
+    functions: Seq[AggregateFunction],
+    inputAttributes: Seq[Attribute]): (InternalRow, InternalRow) => Unit = {
+  val joinedRow = new JoinedRow
+  if (expressions.nonEmpty) {
+    //针对AggregateFunction中的基于表达式的函数构造mergeExpressions
+    val mergeExpressions = functions.zipWithIndex.flatMap {
+      case (ae: DeclarativeAggregate, i) =>
+        expressions(i).mode match {
+          case Partial | Complete => ae.updateExpressions
+          case PartialMerge | Final => ae.mergeExpressions
+        }
+      case (agg: AggregateFunction, _) => Seq.fill(agg.aggBufferAttributes.length)(NoOp)
+    }
+    //针对AggregateFunction中的基于声明式的函数构造updateFunctions
+    val updateFunctions = functions.zipWithIndex.collect {
+      case (ae: ImperativeAggregate, i) =>
+        expressions(i).mode match {
+          //在Partial和Complete模式下，需要进行的是update操作
+          case Partial | Complete =>
+            (buffer: InternalRow, row: InternalRow) => ae.update(buffer, row)
+          //在PartialMerge或者Final模式下，需要进行的是merge操作
+          case PartialMerge | Final =>
+            (buffer: InternalRow, row: InternalRow) => ae.merge(buffer, row)
+        }
+    }.toArray
+    // This projection is used to merge buffer values for all expression-based aggregates.
+    val aggregationBufferSchema = functions.flatMap(_.aggBufferAttributes)
+    //对基于表达式的AggregateFunction生成对应表达式的Projection
+    val updateProjection =
+      newMutableProjection(mergeExpressions, aggregationBufferSchema ++ inputAttributes)
+
+
+    //这里是processRow的处理逻辑
+    (currentBuffer: InternalRow, row: InternalRow) => {
+      // Process all expression-based aggregate functions.
+      //先使用表达式聚合函数进行聚合计算
+      updateProjection.target(currentBuffer)(joinedRow(currentBuffer, row))
+      // Process all imperative aggregate functions.
+      var i = 0
+      ////再使用声明式聚合函数进行聚合计算
+      while (i < updateFunctions.length) {
+        updateFunctions(i)(currentBuffer, row)
+        i += 1
+      }
+    }
+  } else {
+    // Grouping only.
+    //如果聚合表达式为空，则只需要进行分组，每个分组对应的缓冲区不动
+    (currentBuffer: InternalRow, row: InternalRow) => {}
+  }
+}
+
+这样和聚合计算相关的过程我们就看完了，这时只剩最后一步，返回计算结果。因为TungstenAggregationIterator是一个Iterator，因此我们只需要看这两个方法
+hasNext
+next
+hasNext比较简单，如果产生了聚合中间结果，则返回true，否则false
+override final def hasNext: Boolean = {
+  (sortBased && sortedInputHasNewGroup) || (!sortBased && mapIteratorHasNext)
+}
+next方法实现稍微复杂一点。它不断地从聚合buffer中获取到key value，并产生返回结果。我们先看一下，怎么基于聚合buffer的数据产生最终结果，
+protected def generateResultProjection(): (UnsafeRow, InternalRow) => UnsafeRow = {
+  val joinedRow = new JoinedRow
+  val modes = aggregateExpressions.map(_.mode).distinct
+  val bufferAttributes = aggregateFunctions.flatMap(_.aggBufferAttributes)
+  // 代表产生的是最终结果
+  if (modes.contains(Final) || modes.contains(Complete)) {
+    val evalExpressions = aggregateFunctions.map {
+      // 直接通过表达式函数的evaluateExpression表达式
+      case ae: DeclarativeAggregate => ae.evaluateExpression
+      case agg: AggregateFunction => NoOp
+    }
+    // 用来保存聚合结果的InternalRow
+    val aggregateResult = new SpecificInternalRow(aggregateAttributes.map(_.dataType))
+    // 用来在结果Row上面进行修改
+    val expressionAggEvalProjection = newMutableProjection(evalExpressions, bufferAttributes)
+    expressionAggEvalProjection.target(aggregateResult)
+
+
+    // 用来产生输出结果的Projection
+    val resultProjection =
+      UnsafeProjection.create(resultExpressions, groupingAttributes ++ aggregateAttributes)
+    resultProjection.initialize(partIndex)
+
+
+    (currentGroupingKey: UnsafeRow, currentBuffer: InternalRow) => {
+      // Generate results for all expression-based aggregate functions.
+      // 对聚合结果进行修改（通过表达式聚合函数）
+      expressionAggEvalProjection(currentBuffer)
+      // Generate results for all imperative aggregate functions.
+      // 对聚合结果进行修改（通过声明式聚合函数）
+      var i = 0
+      while (i < allImperativeAggregateFunctions.length) {
+        aggregateResult.update(
+          allImperativeAggregateFunctionPositions(i),
+          allImperativeAggregateFunctions(i).eval(currentBuffer))
+        i += 1
+      }
+      // 输出最终结果
+      resultProjection(joinedRow(currentGroupingKey, aggregateResult))
+    }
+  } else if (modes.contains(Partial) || modes.contains(PartialMerge)) {
+    // 如果只是partial或者partialMerge模式，不用产生最终结果，输出缓冲结果即可
+    val resultProjection = UnsafeProjection.create(
+      groupingAttributes ++ bufferAttributes,
+      groupingAttributes ++ bufferAttributes)
+    resultProjection.initialize(partIndex)
+
+
+    // TypedImperativeAggregate stores generic object in aggregation buffer, and requires
+    // calling serialization before shuffling. See [[TypedImperativeAggregate]] for more info.
+    val typedImperativeAggregates: Array[TypedImperativeAggregate[_]] = {
+      aggregateFunctions.collect {
+        case (ag: TypedImperativeAggregate[_]) => ag
+      }
+    }
+
+
+    (currentGroupingKey: UnsafeRow, currentBuffer: InternalRow) => {
+      // Serializes the generic object stored in aggregation buffer
+      var i = 0
+      while (i < typedImperativeAggregates.length) {
+        typedImperativeAggregates(i).serializeAggregateBufferInPlace(currentBuffer)
+        i += 1
+      }
+      resultProjection(joinedRow(currentGroupingKey, currentBuffer))
+    }
+  } else {
+    // Grouping-only: we only output values based on grouping expressions.
+    val resultProjection = UnsafeProjection.create(resultExpressions, groupingAttributes)
+    resultProjection.initialize(partIndex)
+    (currentGroupingKey: UnsafeRow, currentBuffer: InternalRow) => {
+      resultProjection(currentGroupingKey)
+    }
+  }
+}
+执行过程如注释所示。
+
+
+
+
+
+
+
+
